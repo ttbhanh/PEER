@@ -1,56 +1,47 @@
 # PEER — Personalized Evidence Extraction from Reviews
 
-PEER selects `k` evidence sentences from an item's _existing_ reviews that best
-anticipate the review a specific user will write for that item **before that
-review exists**. Every candidate sentence and all user-history signal must
-temporally precede the target review's timestamp (no future-review leakage).
+PEER selects `k` evidence sentences from an item's *existing* reviews that
+best anticipate the review a specific user will write for that item **before
+that review exists**. Every candidate sentence and all user-history signal
+temporally precede the target review (no future-review leakage).
 
-PEER is a two-stage architecture: (1) a LightGBM ranker scores every candidate
-sentence independently on a composite relevance label, then (2) a greedy
-aspect-coverage selector assembles the final `k`-sentence evidence set.
+PEER is a two-stage framework: (1) a LightGBM ranker scores every candidate
+sentence on a composite relevance label, then (2) a greedy aspect-coverage
+selector assembles the final `k`-sentence evidence set.
 
-This repository contains the experimental pipeline used in the paper:
-case construction, aspect extraction, sentence embeddings, the PEER
+This repository contains the full experimental pipeline behind the paper:
+temporal case construction, aspect extraction, sentence embeddings, the PEER
 ranker/selector, task-adapted reproductions of five published
-explainable-recommendation baselines (NARRE, HRDR, A2SPR, ERRA-R, PRAG),
-five classical linear-feature baselines, and the evaluation/significance-test
-tooling. It does **not** include the paper's raw data, cached embeddings, or
-trained model checkpoints (large binary artifacts) — see
+explainable-recommendation baselines (NARRE, HRDR, A2SPR, ERRA-R, PRAG), five
+classical heuristic baselines, the evaluation/significance-testing tooling,
+the independent-encoder/extractor robustness check, and the LLM case-study
+tooling. It does **not** include the paper's raw review data, cached
+embeddings, or trained model checkpoints (large binary artifacts) — see
 ["Getting the data"](#2-getting-the-data) below.
-
-> **This release excludes SEER, the single-feature `item_salience` linear
-> heuristic, and the five metadata-conditioned linear heuristics
-> (BM25-metadata, BM25-user+metadata, SBERT-metadata, SBERT-user+metadata,
-> MMR-user+metadata)** that appear in the paper. If you are trying to
-> reproduce a table cell involving one of those methods, this codebase will
-> not produce it as-is.
 
 **On the published baselines:** NARRE, HRDR, A2SPR, ERRA-R, and PRAG are
 implemented here as **task-adapted reimplementations** under PEER's
 sentence-selection setting, not bit-exact reproductions of their original
-repositories (those solve rating-prediction or generation tasks, not
-sentence selection). See `configs/baselines/manifest.json` for the mechanism
-each adapter implements and how it differs from the original paper.
+repositories (those solve rating-prediction or generation tasks, not sentence
+selection). See `configs/baselines/manifest.json` for exactly what each
+adapter implements and how it differs from the original paper.
 
 ## Repository layout
 
 ```
-peer/                  Core library: ranker features, selector, metrics,
-                        aspect extraction, sentiment, embeddings I/O
-scripts/                Every pipeline stage as a standalone CLI script
+peer/                   Core library: ranker features, selector, metrics,
+                         aspect extraction, sentiment, embeddings I/O
+scripts/                 Every pipeline stage as a standalone CLI script
 baselines/
-  common/               Shared prediction-writing I/O
-  published/            NARRE, HRDR (neural/), A2SPR, ERRA-R, PRAG
-  llm/                  Optional OpenAI-compatible zero-shot LLM baseline
+  published/             NARRE, HRDR (neural/), A2SPR, ERRA-R, PRAG
 configs/
-  default.yaml          Case-construction / embedding / selector defaults
   baselines/manifest.json  Per-baseline mechanism description + honesty flags
-examples/               End-to-end reference pipelines (see below)
-tests/                  pytest suite for the published-baseline scorers
+examples/                 End-to-end reference pipeline (see below)
+tests/                    pytest suite for the core library
 ```
 
 `data/`, `embeddings/`, `models/`, `outputs/`, `results/` are created by the
-pipeline at runtime and are not included in this package (see `.gitignore`).
+pipeline at runtime and are not included in this package.
 
 ## 1. Installation
 
@@ -65,21 +56,21 @@ pip install -e .                  # core dependencies only
 Optional extras (install what you need):
 
 ```bash
-pip install -e '.[lightgbm]'      # LightGBM ranker backend (falls back to
-                                   # scikit-learn HistGradientBoosting if absent)
-pip install -e '.[gpu]'           # torch, transformers, sentence-transformers,
-                                   # accelerate — needed for real sentence
-                                   # embeddings, NARRE/HRDR, and the
-                                   # cross-encoder/PRAG-retriever features
-pip install -e '.[llm]'           # optional OpenAI-compatible LLM baseline
-pip install -e '.[dev]'           # pytest, ruff
+pip install -e '.[gpu]'                # torch, transformers, sentence-transformers,
+                                        # accelerate -- needed for real sentence
+                                        # embeddings, NARRE/HRDR, and the
+                                        # PEER/PRAG retriever training
+pip install -e '.[lightgbm]'           # LightGBM ranker backend (falls back to
+                                        # scikit-learn RandomForest if absent)
+pip install -e '.[aspects]'            # spaCy, for the aspect-extraction pipeline
+pip install -e '.[independent-check]'  # YAKE, only for scripts/independent_check.py aspect
+pip install -e '.[dev]'                # pytest
 ```
 
-`requirements.txt` is an alternative flat list covering the same packages
-plus `spacy` (used, with a regex fallback, for aspect-phrase extraction) if
+`requirements.txt` is an alternative flat list covering the same packages if
 you prefer `pip install -r requirements.txt`. For spaCy's English model:
-`python -m spacy download en_core_web_sm` (optional — `--method hybrid`
-falls back to a regex-only extractor if spaCy isn't installed).
+`python -m spacy download en_core_web_sm` (optional — the aspect extractor
+falls back to a regex/frequency-based method if spaCy isn't installed).
 
 Verify the install:
 
@@ -89,14 +80,14 @@ pytest -q
 
 ## 2. Getting the data
 
-PEER was evaluated on three platforms. None of their raw review dumps are
+The paper evaluates three platforms. None of their raw review dumps are
 redistributed here — download them yourself and convert to the schema below.
 
-| Platform                            | Source                                                  | Item-ID field |
-| ----------------------------------- | ------------------------------------------------------- | ------------- |
-| Amazon Reviews 2023 (Baby category) | https://amazon-reviews-2023.github.io/                  | `parent_asin` |
-| Yelp Open Dataset                   | https://www.yelp.com/dataset                            | `business_id` |
-| Google Local Reviews (2021)         | https://cseweb.ucsd.edu/~jmcauley/datasets/googlelocal/ | `gmap_id`     |
+| Platform | Source | Item-ID field |
+|---|---|---|
+| Amazon Reviews 2023 (Baby category) | https://amazon-reviews-2023.github.io/ | `parent_asin` |
+| Yelp Open Dataset | https://business.yelp.com/data/resources/open-dataset/ | `business_id` |
+| Google Local Reviews (2021) | https://mcauleylab.ucsd.edu/public_datasets/gdrive/googlelocal/ | `gmap_id` |
 
 Convert each platform's raw dump into two JSONL files per dataset name
 (`<name>_reviews.jsonl`, `<name>_metadata.jsonl`) under `data/raw/`, one
@@ -104,182 +95,131 @@ review/listing per line, with (at minimum) these fields:
 
 ```json
 // data/raw/<name>_reviews.jsonl
-{
-  "user_id": "U1",
-  "<item-id-field>": "I1",
-  "rating": 5,
-  "text": "...",
-  "timestamp": 1710000000000,
-  "helpful_vote": 2
-}
+{"user_id": "U1", "<item-id-field>": "I1", "rating": 5, "text": "...", "timestamp": 1710000000000, "helpful_vote": 2}
 ```
 
 ```json
 // data/raw/<name>_metadata.jsonl
-{
-  "<item-id-field>": "I1",
-  "title": "...",
-  "description": "...",
-  "category": "..."
-}
+{"<item-id-field>": "I1", "title": "...", "description": "...", "category": "..."}
 ```
 
 `timestamp` must be milliseconds since epoch. `scripts/build_cases.py` reads
 whichever field names you tell it via `--user-col`/`--item-col`/`--text-col`/
 `--rating-col`/`--timestamp-col`/`--helpful-col` (defaults match the Amazon
-schema: `user_id`/`parent_asin`/`text`/`rating`/`timestamp`/`helpful_vote`).
-For Yelp/Google Local, pass `--item-col business_id` or `--item-col gmap_id`
-respectively.
+schema).
 
-**No data yet?** `scripts/make_demo_data.py` generates small synthetic
-reviews so you can smoke-test the whole pipeline without downloading
-anything — see the next section.
-
-## 3. Quick start: smoke test on synthetic data
+## 3. Reproducing the paper's numbers
 
 ```bash
-bash examples/run_demo_full.sh
+bash examples/reproduce_paper.sh
 ```
 
-This generates a tiny synthetic dataset, builds temporal cases, extracts
-aspects, computes TF-IDF fallback embeddings (no GPU/model download needed),
-builds ranker features, trains PEER, runs five classical baselines plus
-two published baselines that need no training (A2SPR, ERRA-R), and
-writes aggregate metrics to `results/all_results.csv`. Runs in well under a
-minute on CPU. Use this to confirm your environment is set up correctly
-before pointing the same scripts at real data.
+This is a single, documented, ready-to-run script implementing every stage in
+order: temporal case construction per platform → concatenation into one
+joint pool → aspect extraction → sentence embeddings → PEER's target
+retriever + PRAG's retriever (both jointly trained across all three
+platforms) → ranker features/label → 5 heuristic baselines → NARRE/HRDR
+training (per-platform, since their rating-prediction objective is inherently
+platform-specific) → all 5 published baselines → PEER ranker training →
+final evidence selection → grouped ablation → evidence-budget sensitivity →
+evaluation → bootstrap significance → independent-encoder/extractor
+robustness check → illustrative-case export.
 
-`examples/run_demo.sh` is a similar, slightly smaller variant that also
-demonstrates `scripts/run_ablation.py`, `scripts/export_case_studies.py`,
-and `scripts/make_tables.py`.
+Read the script before running it — it takes hours on real data (embedding
+generation and NARRE/HRDR training are the slow stages) and expects the raw
+files described above under `data/raw/`.
 
-## 4. Full pipeline on real data (single platform)
+### Exact configuration behind the reported numbers
 
-`examples/run_amazon_3day.sh` is a documented, ready-to-run reference for
-one platform (adjust `--datasets`/`--item-col` for Yelp or Google Local).
-The stages, in order:
+These are the actual values used, not just script defaults reproduced by
+accident — read this section before changing any flag if you want numbers
+that match the paper.
+
+- **Case construction** (`scripts/build_cases.py`): `--min-user-history 3
+  --min-candidate-reviews 5 --min-candidate-sentences 20
+  --max-candidate-sentences 300 --max-user-history-sentences 100
+  --max-cases-per-dataset 8000`, then chronologically split 70/10/20 per
+  platform (identical 5,600/800/1,600 train/valid/test on each of the three
+  platforms, 4,800 pooled test cases).
+- **Encoder**: `sentence-transformers/all-mpnet-base-v2` for every
+  ranker feature, the composite training label, and the primary sem-F1
+  metric.
+- **Composite training label weights** (`scripts/build_features.py`):
+  semantic=0.70, aspect=0.15, sentiment=0.10, coverage=0.05 — the outcome of
+  the label-weight search described in the paper's Discussion section
+  ("23 broad configurations" + "a focused five-point semantic-weight sweep");
+  see `scripts/search_label_weights.py` to re-run that search.
+- **Selector hyperparameters** (`scripts/select_topk.py`):
+  `lambda_coverage=0.1`, `mu_redundancy=eta_noise=nu_aspect_repeat=0.0` — the
+  paper's noise/redundancy penalty terms are tuned to zero in the final
+  configuration (Discussion: PEER optimizes purely for utility + aspect
+  coverage rather than trading sem-F1/aspect-F1 for noise/redundancy). See
+  `scripts/tune_selector.py` for the 15-point `lambda_coverage` sweep.
+- **Ranker**: LightGBM, `learning_rate=0.05, num_leaves=63,
+  n_estimators=600, min_child_samples=20, subsample=colsample_bytree=0.9,
+  random_state=42` (`peer/models.py`).
+- **Ranker features** (9, `peer/models.py::FEATURE_COLUMNS_DEFAULT`):
+  `user_sem_sim, item_sem_sim, target_emb_sim, user_aspect_overlap,
+  item_aspect_salience, helpfulness_norm, recency_norm, sentence_len_norm,
+  aspect_count_norm` — exactly the paper's φ,ψ,ρ,α,β,γ,δ,η,κ.
+- **Significance testing**: two-sided paired bootstrap, 2,000 resamples,
+  `scripts/significance_test.py`, against PRAG/ERRA-R/A2SPR/BM25-user/HRDR/
+  NARRE/Random, per platform and pooled.
+- **Seeds**: 42 throughout (case sampling, ranker training, retriever
+  training, NARRE/HRDR training, bootstrap resampling).
+
+## 4. Independent-encoder / independent-extractor robustness check
+
+The paper's Discussion section addresses a real circularity risk: PEER's own
+ranker features and composite training label share the encoder used for
+sem-F1 (`all-mpnet-base-v2`) and the aspect extractor used for aspect-F1
+(hybrid spaCy noun-chunking). `scripts/independent_check.py` re-scores every
+method's *already-selected* evidence (no re-training, no re-selection)
+against two independent measurements never used anywhere in PEER's own
+features/label/selector:
 
 ```bash
-# 1. Temporal, leakage-free case construction
-python scripts/build_cases.py \
-  --datasets baby --raw-dir data/raw --output data/cases \
-  --min-user-history 3 --min-candidate-reviews 5 \
-  --min-candidate-sentences 20 --max-candidate-sentences 300 \
-  --max-user-history-sentences 100
+python scripts/independent_check.py semantic \
+  --pred-dir outputs/predictions --cases data/cases \
+  --output results/independent_semantic_per_case.csv
+python scripts/independent_check.py aspect \
+  --pred-dir outputs/predictions --cases data/cases \
+  --output results/independent_aspect_per_case.csv
+```
 
-# 2. Aspect extraction (hybrid noun-chunk + frequency method)
-python scripts/extract_aspects.py --cases data/cases \
-  --output data/processed/aspects --method hybrid --min-count 2 --max-vocab 10000
+`semantic` uses `BAAI/bge-base-en-v1.5` (different base architecture and
+training recipe from `all-mpnet-base-v2`, no shared checkpoint lineage) to
+recompute sem-F1. `aspect` uses YAKE (unsupervised, statistical, no parsing,
+no corpus-level vocabulary — the opposite design axis from the shared hybrid
+spaCy pipeline) to recompute aspect-F1. Both subcommands also write a paired
+bootstrap significance table (PEER vs. each baseline, per platform and
+pooled, 2,000 resamples — same protocol as `significance_test.py`).
 
-# 3. Sentence embeddings (all-mpnet-base-v2; add --force-tfidf for a
-#    no-GPU/no-download fallback)
-python scripts/cache_embeddings.py --cases data/cases \
-  --model sentence-transformers/all-mpnet-base-v2 \
-  --batch-size 1024 --device cuda --fp16 --output embeddings/embeddings.npz
+## 5. LLM case study
 
-# 4. (Optional but used by the paper's final config) train PEER's own
-#    target-embedding retriever and PRAG's retriever, feeding two of the
-#    nine ranker features (target_emb_sim, and PRAG's own score)
-python scripts/train_peer_retriever.py --cases data/cases \
-  --embeddings embeddings/embeddings --output models/peer_target_retriever.pt
-python scripts/train_prag_retriever.py --cases data/cases \
-  --embeddings embeddings/embeddings --output models/prag_retriever.pt
+The paper's qualitative comparison against general-purpose LLMs
+(Sec. "Case Study: PEER vs. General-Purpose LLMs") is a manual, zero-shot
+protocol — each LLM is queried independently through its normal chat
+interface with a fixed prompt, not a programmatic API loop, so the release
+doesn't pin the exact protocol to one vendor's SDK.
 
-# 5. Ranker features + composite training label. --semantic-weight/
-#    --aspect-weight/--sentiment-weight/--coverage-weight set the label's
-#    component weights; see "Reproducing the paper's numbers" below for the
-#    exact values behind the reported results.
-python scripts/build_features.py --cases data/cases \
-  --aspects data/processed/aspects/sentence_aspects.parquet \
-  --embeddings embeddings/embeddings.npz \
-  --peer-retriever models/peer_target_retriever.pt \
-  --output data/processed/pairs
+```bash
+# 1. Export the exact prompt (user history + numbered, ID-tagged candidate
+#    pool + instructions) for a given case:
+python scripts/llm_case_study.py export --case-id baby_4418 \
+  --cases data/cases --output outputs/case_studies/prompt_baby_4418.txt
 
-# 6. Classical linear-feature baselines (no training)
-python scripts/run_baselines.py --pairs-dir data/processed/pairs --split test \
-  --methods random popular recent bm25_user sbert_user \
-  --k-list 1 3 5 user_avg --embeddings embeddings/embeddings.npz \
-  --output outputs/predictions/baselines
+# 2. Paste the prompt into any LLM chat interface. It returns a JSON array
+#    of chosen sentence IDs, e.g. ["baby_r3162241_s7", ...].
 
-# 7. Published baselines that need no training
-python scripts/run_published_baselines.py --cases data/cases --split test \
-  --aspects data/processed/aspects/sentence_aspects.parquet \
-  --aspect-vocab data/processed/aspects/aspect_vocab.jsonl \
-  --embeddings embeddings/embeddings.npz \
-  --methods a2spr erra_r prag --models-dir models \
-  --k-list 1 3 5 user_avg --output outputs/predictions/published
-
-# 7b. (Optional) NARRE/HRDR need their own rating-regression pretraining
-#     first, on a temporally-safe pool of raw reviews:
-python scripts/train_published_neural.py --model narre --dataset baby \
-  --raw-dir data/raw --cases data/cases --output models/narre_baby.pt
-python scripts/train_published_neural.py --model hrdr --dataset baby \
-  --raw-dir data/raw --cases data/cases --output models/hrdr_baby.pt
-# then re-run step 7 with --methods narre hrdr added
-
-# 8. Train PEER's ranker and select the final k-sentence evidence sets
-python scripts/train_ltr.py --train data/processed/pairs/train.parquet \
-  --valid data/processed/pairs/valid.parquet --output models/peer_ltr.pkl
-python scripts/select_topk.py --pairs-dir data/processed/pairs \
-  --model models/peer_ltr.pkl --splits test --method-name peer_full \
-  --k-list 1 3 5 user_avg --embeddings embeddings/embeddings.npz \
-  --output outputs/predictions/peer
-
-# 9. Evaluate everything and run bootstrap significance tests
-python scripts/evaluate_evidence.py --pred-dir outputs/predictions \
+# 3. Score the returned selection against the held-out review:
+python scripts/llm_case_study.py score --case-id baby_4418 \
   --cases data/cases --embeddings embeddings/embeddings.npz \
-  --output results/evaluation.csv --per-case-output results/per_case.csv
-python scripts/significance_test.py --per-case results/per_case.csv \
-  --main-method peer_full \
-  --baselines a2spr bm25_user erra_r hrdr narre prag random sbert_user \
-  --metrics sem_f1 aspect_f1 noise redundancy --bootstrap 2000 \
-  --output results/significance.csv
+  --response '["baby_r3162241_s7", "baby_r924024_s1"]'
 ```
 
-`scripts/tune_selector.py` and `scripts/search_label_weights.py` reproduce
-the paper's hyperparameter searches (selector coverage weight and training
-label weights respectively) on the validation split.
-
-## 5. Reproducing the paper's three-platform results
-
-The paper reports Amazon Reviews 2023 (Baby), Yelp Open Dataset, and Google
-Local Reviews with **one PEER ranker and one PRAG retriever jointly trained
-across all three platforms**, and NARRE/HRDR retrained from scratch on each
-platform's own corpus. To reproduce this exactly:
-
-1. Run steps 1–3 above (`build_cases.py` → `extract_aspects.py` →
-   `cache_embeddings.py`) **separately for each platform** (`--datasets baby`,
-   `--datasets yelp --item-col business_id`,
-   `--datasets googlelocal --item-col gmap_id`), each with
-   `--max-candidate-sentences 300 --min-user-history 3
---min-candidate-reviews 5 --min-candidate-sentences 20`.
-2. Concatenate the three platforms' `cases_{train,valid,test}.jsonl`,
-   `sentence_aspects.parquet`, and embeddings (`.npy` + `.ids.json`) files
-   into one joint pool before running `build_features.py`/`train_peer_retriever.py`/
-   `train_prag_retriever.py`/`train_ltr.py` on the combined pool (steps
-   4–5, 8 above) — this is what makes the ranker and retriever _jointly_
-   trained rather than per-platform. `select_topk.py` (step 8) and
-   `run_published_baselines.py` (step 7) can then be run once on the
-   combined test split, or per-platform via their `--dataset` flag if
-   memory-constrained.
-3. Use the **final label weights** for `build_features.py`:
-   `--semantic-weight 0.70 --aspect-weight 0.15 --sentiment-weight 0.10
---coverage-weight 0.05` (this is the outcome of the paper's label-weight
-   search, §"Selector Hyperparameter and Label-Weight Search" — see
-   `scripts/search_label_weights.py` to re-run that search yourself). The
-   selector's own hyperparameters are `select_topk.py`'s defaults
-   (`--lambda-coverage 0.1`, all other penalty terms at 0) — nothing else
-   needs to be passed.
-4. NARRE/HRDR (step 7b) are trained **once per platform**, never shared
-   across platforms — their rating-regression objective is inherently
-   platform-specific.
-5. Run steps 9 (evaluate + significance) once on the combined per-platform
-   `per_case.csv`, or separately per platform then concatenate before
-   calling `significance_test.py` — it groups by the `dataset` column
-   automatically, so a combined `per_case.csv` gives you per-platform _and_
-   pooled numbers in one pass (duplicate every row with `dataset` overwritten
-   to a constant value, e.g. `"pooled"`, and concatenate that in too, to get
-   the pooled figures from the same script).
+This is disclosed in the paper as a qualitative illustration (one case, no
+significance claim), not an aggregate benchmark — see Discussion/Limitations.
 
 ## 6. Testing
 
@@ -287,15 +227,28 @@ platform's own corpus. To reproduce this exactly:
 pytest -q
 ```
 
-Covers the published-baseline scorers (`baselines/published/scorers.py`) in
-isolation from the rest of the pipeline.
+Covers the core library (`peer/selectors.py`, `peer/aspects.py`,
+`peer/metrics.py`, `peer/sentiment.py`, `peer/aspect_sentiment.py`) in
+isolation from the data pipeline.
 
 ## Notes and known limitations
 
 - `peer/models.py`'s `RankerModel` prefers LightGBM and falls back to
-  scikit-learn's `HistGradientBoostingRegressor` if LightGBM isn't
-  installed or fails to import (e.g. missing OpenMP runtime on some macOS
-  setups) — pass `--backend sklearn_hgb` to force the fallback explicitly.
+  scikit-learn's `RandomForestRegressor` if LightGBM isn't installed or
+  fails to import (e.g. missing OpenMP runtime on some macOS setups) — pass
+  `--backend sklearn_rf` to force the fallback explicitly. The paper's
+  reported numbers use the LightGBM backend.
 - `scripts/cache_embeddings.py --force-tfidf` produces a deterministic,
   no-download, no-GPU embedding fallback (TF-IDF + truncated SVD) suitable
-  for smoke tests; it is not what the paper's reported numbers use.
+  for a smoke test of the pipeline's plumbing; it is not what the paper's
+  reported numbers use.
+- NARRE/HRDR are retrained **once per platform** (never shared across
+  platforms), since their rating-regression objective is inherently
+  platform-specific — see `scripts/train_published_neural.py`.
+- Combining LightGBM and PyTorch (e.g. a script that both scores with the
+  ranker and calls the target retriever in a tight loop) has been observed to
+  segfault intermittently on some environments, most likely an OpenMP
+  threading conflict. If you hit this, split the two library's usage into
+  separate process invocations (compute/pickle the torch-side outputs first,
+  then load and score with lightgbm in a second process that never imports
+  torch).

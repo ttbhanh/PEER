@@ -48,7 +48,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--per-case', default='results/per_case.csv')
     ap.add_argument('--main-method', default='peer_full')
-    ap.add_argument('--baselines', nargs='+', default=['sbert_user','bm25_user','random'])
+    ap.add_argument('--baselines', nargs='+', default=['sbert_user_metadata','mmr_user_metadata','bm25_user','random'])
     ap.add_argument('--metrics', nargs='+', default=['sem_f1','aspect_f1','noise','redundancy'])
     ap.add_argument('--k-list', nargs='+', default=None)
     ap.add_argument('--bootstrap', type=int, default=1000)

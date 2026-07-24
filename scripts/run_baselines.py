@@ -17,12 +17,11 @@ try:
     from rank_bm25 import BM25Okapi
 except Exception:
     class BM25Okapi:
+        """Minimal BM25 fallback if rank_bm25 isn't installed."""
         def __init__(self, tokenized_corpus, k1=1.5, b=0.75):
             import math
             from collections import Counter
-            self.corpus = tokenized_corpus
-            self.k1 = k1
-            self.b = b
+            self.k1, self.b = k1, b
             self.doc_len = [len(d) for d in tokenized_corpus]
             self.avgdl = sum(self.doc_len) / max(1, len(self.doc_len))
             self.freqs = [Counter(d) for d in tokenized_corpus]
@@ -31,6 +30,7 @@ except Exception:
                 df.update(set(d))
             n = max(1, len(tokenized_corpus))
             self.idf = {t: math.log(1 + (n - c + 0.5) / (c + 0.5)) for t, c in df.items()}
+
         def get_scores(self, query_tokens):
             scores = []
             for f, dl in zip(self.freqs, self.doc_len):
@@ -50,6 +50,8 @@ from peer.selectors import resolve_k, topk
 from peer.text import tokenize
 from peer.utils import ensure_dir, write_jsonl
 
+METHODS = ['random', 'popular', 'recent', 'bm25_user', 'sbert_user']
+
 
 def load_embeddings(path: str | None):
     if not path:
@@ -58,8 +60,6 @@ def load_embeddings(path: str | None):
     npy_path = p.with_suffix('.npy')
     if not npy_path.exists():
         return {}
-    # Plain .npy (mmap-able) + sibling ids.json, not .npz -- see
-    # peer/embeddings.py::_npy_and_ids_paths.
     emb = np.load(npy_path, mmap_mode='r')
     with open(p.with_suffix('.ids.json')) as f:
         ids = json.load(f)
@@ -69,16 +69,9 @@ def load_embeddings(path: str | None):
 def to_list(x):
     if x is None:
         return []
-    if isinstance(x, (list, tuple, set)):
+    if isinstance(x, (list, tuple, set, np.ndarray)):
         return list(x)
     try:
-        import numpy as np
-        if isinstance(x, np.ndarray):
-            return x.tolist()
-    except Exception:
-        pass
-    try:
-        import pandas as pd
         if pd.isna(x):
             return []
     except Exception:
@@ -87,13 +80,7 @@ def to_list(x):
 
 
 def parse_k_list(values):
-    out = []
-    for v in values:
-        if str(v).lower() in {'user_avg', 'user_avg_k', 'user'}:
-            out.append('user_avg')
-        else:
-            out.append(int(v))
-    return out
+    return ['user_avg' if str(v).lower() in {'user_avg', 'user_avg_k', 'user'} else int(v) for v in values]
 
 
 def method_scores(method: str, group: pd.DataFrame) -> np.ndarray:
@@ -109,9 +96,7 @@ def method_scores(method: str, group: pd.DataFrame) -> np.ndarray:
     if method == 'bm25_user':
         tokenized = [tokenize(t) for t in group['text'].tolist()]
         bm25 = BM25Okapi(tokenized)
-        first = group.iloc[0]
-        q = to_list(first.get('user_aspects'))
-        q_toks = tokenize(' '.join(q))
+        q_toks = tokenize(' '.join(to_list(group.iloc[0].get('user_aspects'))))
         return np.asarray(bm25.get_scores(q_toks), dtype=float) if q_toks else np.zeros(n)
     raise ValueError(f'Unknown baseline method: {method}')
 
@@ -151,9 +136,9 @@ def prediction_row(case_id, dataset, method, kname, selected, group):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--pairs-dir', default='data/processed/pairs')
-    ap.add_argument('--split', default='test', choices=['train','valid','test'])
-    ap.add_argument('--methods', nargs='+', default=['random','popular','recent','bm25_user','sbert_user'])
-    ap.add_argument('--k-list', nargs='+', default=['1','3','5','user_avg'])
+    ap.add_argument('--split', default='test', choices=['train', 'valid', 'test'])
+    ap.add_argument('--methods', nargs='+', default=METHODS)
+    ap.add_argument('--k-list', nargs='+', default=['1', '3', '5', 'user_avg'])
     ap.add_argument('--embeddings', default='embeddings/embeddings.npz')
     ap.add_argument('--output', default='outputs/predictions/baselines')
     ap.add_argument('--seed', type=int, default=42)
@@ -167,7 +152,7 @@ def main():
 
     for method in args.methods:
         preds = []
-        for (case_id, dataset), group in tqdm(df.groupby(['case_id','dataset']), desc=f'{method}'):
+        for (case_id, dataset), group in tqdm(df.groupby(['case_id', 'dataset']), desc=method):
             scores = method_scores(method, group)
             cands = group_to_candidates(group, scores, embs)
             for kv in k_list:

@@ -18,14 +18,7 @@ from peer.utils import ensure_dir
 def _read_feature_columns(path: str) -> pd.DataFrame:
     """Read only the numeric feature+label columns RankerModel.fit() actually
     uses, instead of the full pairs table (which also carries text/aspect
-    columns for every row -- multiple GB for a large split, and the sole
-    cause found for an OOM here on the 32GB GPU server, since RankerModel
-    never touches those columns at all)."""
-    # .schema (the raw Parquet schema) flattens list<string> columns down to
-    # their nested 'element' leaf name rather than the top-level column name
-    # -- .schema_arrow (the higher-level Arrow schema) gives real column
-    # names, which matters here if FEATURE_COLUMNS_DEFAULT is ever extended
-    # to include a list-typed column.
+    columns for every row -- several GB at full scale)."""
     available = set(pq.ParquetFile(path).schema_arrow.names)
     wanted = [c for c in FEATURE_COLUMNS_DEFAULT if c in available]
     if 'label' in available:
@@ -39,7 +32,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--train', default='data/processed/pairs/train.parquet')
     ap.add_argument('--valid', default='data/processed/pairs/valid.parquet')
-    ap.add_argument('--backend', default='auto', choices=['auto','lightgbm','sklearn_hgb'])
+    ap.add_argument('--backend', default='auto', choices=['auto', 'lightgbm', 'sklearn_rf'],
+                     help='sklearn_rf (RandomForest) is an environment fallback if LightGBM is unavailable; '
+                          'the paper\'s reported numbers use lightgbm.')
     ap.add_argument('--drop-features', nargs='*', default=[])
     ap.add_argument('--output', default='models/peer_ltr.pkl')
     args = ap.parse_args()

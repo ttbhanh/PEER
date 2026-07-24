@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 """Task-adapted reimplementations of 5 published baselines, each following the
-*actual* mechanism of its paper (see configs/baselines/manifest.json for the
-citations and per-method notes on what had to be adapted for PEER's sentence-
-selection task, since none of the five were designed for it):
+*actual* mechanism of its paper (see configs/baselines/manifest.json for
+citations and per-method adaptation notes, since none of the five were
+designed for sentence-level evidence selection):
 
   a2spr    Huang et al. 2020 -- cosine similarity between per-aspect sentiment
            vectors (candidate sentence vs. user history).
@@ -12,8 +12,8 @@ selection task, since none of the five were designed for it):
            boosted for candidates covering the (user,item) pair's top-n salient
            aspects. (The paper's explanation-generation stage does not apply.)
   prag     EMNLP 2023 -- a small trained retriever estimates a target-review
-           embedding from (user, metadata) and ranks candidates by similarity to
-           it; a scaled-down stand-in for the paper's transformer retriever
+           embedding from (user, metadata) and ranks candidates by similarity
+           to it; a scaled-down stand-in for the paper's transformer retriever
            (see scripts/train_prag_retriever.py). Generation stage not applicable.
   narre    WWW 2018 -- real trained CNN+attention rating-prediction network
            (scripts/train_published_neural.py); we score candidates using its
@@ -22,9 +22,6 @@ selection task, since none of the five were designed for it):
   hrdr     Neurocomputing 2020 -- same training entrypoint, --model hrdr;
            attention context is the frozen user-item rating matrix instead of
            review-author identity.
-
-This script replaces the old flat linear-formula scorers (baselines/published/
-scorers.py) which is kept only for tests/backward reference.
 """
 
 import sys
@@ -53,12 +50,6 @@ ALL_METHODS = ['narre', 'hrdr', 'a2spr', 'erra_r', 'prag']
 
 
 def load_embeddings(path: str, needed_ids: set[str] | None = None) -> dict[str, np.ndarray]:
-    """Load embeddings from the plain .npy + sibling ids.json pair (see
-    peer/embeddings.py::_npy_and_ids_paths) -- mmap'd, so rows are paged in
-    from disk as reclaimable page cache instead of fully materialized as
-    anon RAM. `needed_ids` (e.g. just one dataset's cases, via --dataset)
-    further limits the dict actually built and retained for the rest of the
-    script's run."""
     p = Path(path)
     emb = np.load(p.with_suffix('.npy'), mmap_mode='r')
     with open(p.with_suffix('.ids.json')) as f:
@@ -70,11 +61,6 @@ def load_embeddings(path: str, needed_ids: set[str] | None = None) -> dict[str, 
 
 def load_aspect_map(path: str, case_ids: set[str]) -> dict[tuple[str, str, str], list[str]]:
     import pandas as pd
-    # Push the case_id filter down to parquet read time (pyarrow row-group
-    # pruning) instead of materializing the full aspects table (millions of
-    # rows, across every case in the dataset) and filtering afterward -- the
-    # full read alone was found to add several GB on top of the embeddings
-    # load, enough to cross the server's 32GB cgroup limit.
     df = pd.read_parquet(path, columns=['case_id', 'kind', 'sentence_id', 'aspects'],
                           filters=[('case_id', 'in', list(case_ids))])
     m: dict[tuple[str, str, str], list[str]] = {}
@@ -95,7 +81,6 @@ def parse_k_list(values: list[str]) -> list[Any]:
     return ['user_avg' if str(v).lower() in {'user', 'user_avg', 'user_avg_k'} else int(v) for v in values]
 
 
-# ---------------------------------------------------------------- A2SPR ----
 def score_a2spr(case: dict, cand_aspects: dict[str, list[str]], user_vec: AspectVector) -> dict[str, float]:
     scores = {}
     for cand in case['candidate_sentences']:
@@ -105,7 +90,6 @@ def score_a2spr(case: dict, cand_aspects: dict[str, list[str]], user_vec: Aspect
     return scores
 
 
-# --------------------------------------------------------------- ERRA-R ----
 def score_erra_r(case: dict, cand_aspects: dict[str, list[str]], embs: dict[str, np.ndarray],
                   user_aspect_counts: Counter, top_n: int = 5, boost: float = 1.3,
                   w_user: float = 0.5, w_meta: float = 0.5) -> dict[str, float]:
@@ -132,7 +116,6 @@ def score_erra_r(case: dict, cand_aspects: dict[str, list[str]], embs: dict[str,
     return scores
 
 
-# ----------------------------------------------------------------- PRAG ----
 def score_prag(case: dict, embs: dict[str, np.ndarray], prag_model) -> dict[str, float]:
     case_id = case['case_id']
     user_emb = embs.get(f'{case_id}_user_history_text')
@@ -148,7 +131,6 @@ def score_prag(case: dict, embs: dict[str, np.ndarray], prag_model) -> dict[str,
     return scores
 
 
-# ---------------------------------------------------------------- NARRE ----
 def score_narre(case: dict, scorer: NarreScorer | None) -> dict[str, float]:
     cands = case['candidate_sentences']
     if scorer is None:
@@ -165,7 +147,6 @@ def score_narre(case: dict, scorer: NarreScorer | None) -> dict[str, float]:
     return {c['sentence_id']: review_score.get(c['review_id'], 0.0) for c in cands}
 
 
-# ----------------------------------------------------------------- HRDR ----
 def score_hrdr(case: dict, scorer: HrdrScorer | None) -> dict[str, float]:
     cands = case['candidate_sentences']
     if scorer is None:
@@ -202,12 +183,8 @@ def main():
     ap.add_argument('--models-dir', default='models')
     ap.add_argument('--output', default='outputs/predictions/published')
     ap.add_argument('--dataset', default=None,
-                     help='Restrict to one dataset (e.g. baby/musical/cellphone) instead of all cases in the '
-                          'split at once. Loading embeddings.npz always decompresses the whole corpus regardless '
-                          '(one monolithic compressed array), but filtering cases+aspects+the retained embeddings '
-                          'dict down to a single dataset cuts peak memory enough to fit the server\'s 32GB cgroup '
-                          'limit; output filenames get a __{dataset} suffix so per-dataset runs can be merged '
-                          '(concatenate the jsonl files) after all datasets have been scored.')
+                     help='Restrict to one dataset instead of the whole split at once; output filenames get a '
+                          '__{dataset} suffix so per-dataset runs can be concatenated afterward.')
     args = ap.parse_args()
 
     cases = read_jsonl(f'{args.cases}/cases_{args.split}.jsonl')
@@ -272,8 +249,6 @@ def main():
             method_scores['narre'] = score_narre(case, narre_scorers.get(case['dataset']))
         if 'hrdr' in args.methods:
             method_scores['hrdr'] = score_hrdr(case, hrdr_scorers.get(case['dataset']))
-
-        cand_by_id = {c['sentence_id']: c for c in cands}
 
         for method, scores in method_scores.items():
             cand_objs = [{'sentence_id': c['sentence_id'], 'text': c['text'],

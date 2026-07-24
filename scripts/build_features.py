@@ -6,14 +6,13 @@ from pathlib import Path as _ProjectPath
 sys.path.insert(0, str(_ProjectPath(__file__).resolve().parents[1]))
 
 import argparse
+import json
 import multiprocessing as mp
 import os
 import pickle
 from collections import Counter
 from pathlib import Path
 from typing import Any
-
-import json
 
 import numpy as np
 import pandas as pd
@@ -30,9 +29,9 @@ from scripts.train_peer_retriever import PeerTargetRetriever
 
 # Explicit, fixed schema for the output pairs parquet -- every _process_case row
 # dict always has exactly these keys/types, so writing batches with this schema
-# (rather than letting pyarrow re-infer it per batch from pd.DataFrame(rows))
-# guarantees every row-group in the incrementally-written file is consistent,
-# even for a batch where e.g. every 'aspects' list happens to be empty.
+# (rather than letting pyarrow re-infer it per batch) guarantees every
+# row-group in the incrementally-written file is consistent, even for a batch
+# where e.g. every 'aspects' list happens to be empty.
 PAIRS_SCHEMA = pa.schema([
     ('case_id', pa.string()), ('dataset', pa.string()), ('split', pa.string()),
     ('user_id', pa.string()), ('item_id', pa.string()), ('sentence_id', pa.string()),
@@ -40,13 +39,12 @@ PAIRS_SCHEMA = pa.schema([
     ('rating', pa.float64()), ('candidate_rating', pa.float64()),
     ('timestamp', pa.int64()), ('candidate_timestamp', pa.int64()),
     ('aspects', pa.list_(pa.string())), ('user_aspects', pa.list_(pa.string())),
-    ('metadata_aspects', pa.list_(pa.string())), ('gt_aspects', pa.list_(pa.string())),
+    ('gt_aspects', pa.list_(pa.string())),
     ('ground_truth_text', pa.string()), ('user_avg_k', pa.int64()), ('label', pa.float64()),
     ('semantic_to_gt', pa.float64()), ('aspect_match_to_gt', pa.float64()),
     ('coverage_gain', pa.float64()), ('user_sem_sim', pa.float64()),
-    ('metadata_sem_sim', pa.float64()), ('item_sem_sim', pa.float64()),
-    ('target_emb_sim', pa.float64()), ('cross_encoder_score', pa.float64()),
-    ('user_aspect_overlap', pa.float64()), ('metadata_aspect_overlap', pa.float64()),
+    ('item_sem_sim', pa.float64()), ('target_emb_sim', pa.float64()),
+    ('user_aspect_overlap', pa.float64()),
     ('item_aspect_salience', pa.float64()), ('sentiment_match', pa.float64()),
     ('helpfulness_norm', pa.float64()), ('recency_norm', pa.float64()),
     ('sentence_len_norm', pa.float64()), ('aspect_count_norm', pa.float64()),
@@ -55,9 +53,8 @@ PAIRS_SCHEMA = pa.schema([
 
 def iter_jsonl_batches(path: Path, batch_size: int):
     """Stream a cases_{split}.jsonl file in bounded batches instead of loading
-    the whole split into memory at once (read_jsonl is eager) -- keeps the
-    per-batch working set (raw case JSON + its feature rows) small and bounded
-    regardless of how many cases are in the split."""
+    the whole split into memory at once -- keeps the per-batch working set
+    small and bounded regardless of split size."""
     batch: list[dict[str, Any]] = []
     with open(path, 'r', encoding='utf-8') as f:
         for line in f:
@@ -76,19 +73,14 @@ def to_list(x):
     if x is None:
         return []
     try:
-        import pandas as pd
         if pd.isna(x):
             return []
     except Exception:
         pass
     if isinstance(x, (list, tuple, set)):
         return list(x)
-    try:
-        import numpy as np
-        if isinstance(x, np.ndarray):
-            return x.tolist()
-    except Exception:
-        pass
+    if isinstance(x, np.ndarray):
+        return x.tolist()
     return [x]
 
 
@@ -96,21 +88,15 @@ class _AspectStore:
     """Read-only sentence_id -> aspect-list lookup backed by a small interned
     vocabulary + one flat int32 array + integer offsets (CSR layout), instead
     of a dict[tuple, list[str]] holding one Python list + several Python
-    strings per sentence. Same fork/COW rationale as _EmbeddingStore above:
-    this is read by forked worker processes (_process_case, via
-    multiprocessing.Pool below) once per candidate sentence considered, for
-    every case -- dense, high-volume traffic at full scale (this was the
-    actual root cause of a second OOM crash on a GPU server run, found only
-    after the first _EmbeddingStore fix left this analogous dict untouched).
+    strings per sentence. Read by forked worker processes (_process_case, via
+    multiprocessing.Pool below) once per candidate sentence, for every case --
+    a dict-of-lists here is dense enough traffic to be the difference between
+    fitting in a bounded-memory environment and OOMing.
 
     The original key was (case_id, kind, sentence_id); dropping case_id/kind
-    down to sentence_id alone is safe, not just an optimization: aspects are
-    a pure function of a sentence's text, so every duplicate sentence_id
-    across different cases (candidate sentences shared by multiple cases'
-    pools) already carried byte-identical aspect lists -- verified directly
-    against the actual data (0 mismatches across 370k+ duplicated
-    sentence_id groups) before making this change, given the cost of being
-    wrong here is a third crash, not just a wrong number."""
+    down to sentence_id alone is safe: aspects are a pure function of a
+    sentence's text, so every duplicate sentence_id across different cases'
+    pools already carries byte-identical aspect lists."""
     __slots__ = ('index', 'aspect_ids', 'offsets', 'vocab')
 
     def __init__(self, index: dict[str, int], aspect_ids: np.ndarray, offsets: np.ndarray, vocab: list[str]):
@@ -129,10 +115,6 @@ class _AspectStore:
 
 def load_aspect_maps(path: Path) -> _AspectStore:
     df = pd.read_parquet(path, columns=['sentence_id', 'aspects'])
-    # dedupe by sentence_id (see _AspectStore docstring: same sentence_id
-    # always carries the same aspects regardless of which case references it,
-    # so later duplicate rows would just overwrite with an identical value --
-    # keep the first occurrence and skip re-processing the rest).
     index: dict[str, int] = {}
     vocab_map: dict[str, int] = {}
     vocab: list[str] = []
@@ -161,18 +143,8 @@ def load_aspect_maps(path: Path) -> _AspectStore:
 class _EmbeddingStore:
     """Read-only embedding lookup backed by one contiguous 2D array + a
     str->int index, instead of a dict[str, np.ndarray] with one Python object
-    per row. Matters specifically because this is read by forked worker
-    processes (_process_case, via multiprocessing.Pool below): CPython bumps
-    the refcount of every object a read touches, which forces copy-on-write
-    page duplication per touched numpy-array object even for a pure read --
-    with one array object per sentence (potentially millions at full scale)
-    and up to --num-workers processes, that COW duplication can multiply
-    resident memory far past the embeddings file's own size and OOM the
-    host. A shared array's *data* buffer isn't touched by per-element Python
-    refcounting, so indexing into it doesn't trigger the same blowup -- only
-    this store's own (much smaller) id->index dict pays that cost, matching
-    the same defense scripts/build_cases.py already applies to its own
-    per-worker shared state (see _code_of there)."""
+    per row -- see _AspectStore docstring for why this matters under
+    multiprocessing.Pool forking."""
     __slots__ = ('matrix', 'index')
 
     def __init__(self, matrix: np.ndarray, index: dict[str, int]):
@@ -185,10 +157,6 @@ class _EmbeddingStore:
 
 
 def load_embeddings(path: Path) -> _EmbeddingStore:
-    # Plain .npy (mmap-able) + sibling ids.json, not .npz -- see
-    # peer/embeddings.py::_npy_and_ids_paths. Rows get paged in from disk as
-    # reclaimable page cache on actual use, instead of the whole multi-GB
-    # array being materialized as anon RAM up front.
     emb = np.load(path.with_suffix('.npy'), mmap_mode='r')
     with open(path.with_suffix('.ids.json')) as f:
         ids = json.load(f)
@@ -210,14 +178,12 @@ _W: dict[str, Any] = {}
 
 def _process_case(item: tuple[str, dict]) -> list[dict[str, Any]]:
     """Build every feature row for one case. Runs in a forked worker process;
-    reads the shared read-only aspect map and embedding dict set up in _W by the
-    parent before Pool creation (copy-on-write fork; no per-task pickling)."""
+    reads the shared read-only aspect map and embedding store set up in _W by
+    the parent before Pool creation (copy-on-write fork; no per-task pickling)."""
     split, c = item
     aspects = _W['aspects']; embs = _W['embs']; w = _W['weights']; retriever = _W.get('peer_retriever')
-    cross_encoder = _W.get('cross_encoder'); ce_topn = _W.get('cross_encoder_topn', 50)
     case_id = c['case_id']
     user_aspects = aspects.get(f'{case_id}_user_history', [])
-    metadata_aspects = aspects.get(f'{case_id}_metadata', [])
     if not user_aspects:
         user_aspects = aspects.get(f'{case_id}_user_history_text', [])
     gt_aspects = []
@@ -231,14 +197,12 @@ def _process_case(item: tuple[str, dict]) -> list[dict[str, Any]]:
             gt_embs.append(e)
     gt_aspects_unique = list(dict.fromkeys(gt_aspects))
     user_emb = get_emb(embs, f'{case_id}_user_history_text')
-    meta_emb = get_emb(embs, f'{case_id}_metadata_text')
     item_profile_embs = [get_emb(embs, cand['sentence_id']) for cand in c['candidate_sentences']]
     item_profile_embs = [e for e in item_profile_embs if e is not None]
     item_emb = np.mean(item_profile_embs, axis=0) if item_profile_embs else None
     # PRAG-style estimate of the target review's own embedding, from (user, item)
-    # context only (see scripts/train_peer_retriever.py -- deliberately metadata-
-    # free, unlike PRAG's own retriever). One forward pass per case, reused below
-    # for every candidate's target_emb_sim feature.
+    # context only (see scripts/train_peer_retriever.py). One forward pass per
+    # case, reused below for every candidate's target_emb_sim feature.
     target_emb = None
     if retriever is not None and user_emb is not None and item_emb is not None:
         with torch.no_grad():
@@ -253,27 +217,6 @@ def _process_case(item: tuple[str, dict]) -> list[dict[str, Any]]:
     t = int(c['timestamp'])
     min_t = min([int(x['timestamp']) for x in c['candidate_sentences']] + [t])
     span_t = max(1, t - min_t)
-
-    # Cross-encoder reranking (scripts/train_cross_encoder.py): a transformer
-    # forward pass per candidate is too slow to run on the full pool (up to
-    # 300/case), so we cheaply pre-rank by target_emb_sim (a single cosine, already
-    # computed above) and only cross-encode the top ce_topn -- the rest get 0,
-    # same fallback the ranker already treats as "no signal" for other features.
-    ce_scores: dict[str, float] = {}
-    if cross_encoder is not None and target_emb is not None:
-        prelim = []
-        for cand in c['candidate_sentences']:
-            e = get_emb(embs, cand['sentence_id'])
-            if e is not None:
-                prelim.append((cosine_vec(e, target_emb), cand))
-        prelim.sort(key=lambda x: -x[0])
-        shortlist = [cand for _, cand in prelim[:ce_topn]]
-        if shortlist:
-            query = c['user_history_text'][:600]
-            import torch as _torch
-            pairs = [(query, cand['text']) for cand in shortlist]
-            preds = cross_encoder.predict(pairs, activation_fn=_torch.nn.Sigmoid(), show_progress_bar=False)
-            ce_scores = {cand['sentence_id']: float(p) for cand, p in zip(shortlist, preds)}
 
     rows: list[dict[str, Any]] = []
     covered_for_label = set()
@@ -305,7 +248,6 @@ def _process_case(item: tuple[str, dict]) -> list[dict[str, Any]]:
             'candidate_timestamp': int(cand['timestamp']),
             'aspects': s_aspects,
             'user_aspects': user_aspects,
-            'metadata_aspects': metadata_aspects,
             'gt_aspects': gt_aspects_unique,
             'ground_truth_text': c['ground_truth_text'],
             'user_avg_k': int(c.get('user_avg_k', 3)),
@@ -314,12 +256,9 @@ def _process_case(item: tuple[str, dict]) -> list[dict[str, Any]]:
             'aspect_match_to_gt': float(asp_match),
             'coverage_gain': float(cov_gain),
             'user_sem_sim': cosine_vec(s_emb, user_emb) if s_emb is not None and user_emb is not None else 0.0,
-            'metadata_sem_sim': cosine_vec(s_emb, meta_emb) if s_emb is not None and meta_emb is not None else 0.0,
             'item_sem_sim': cosine_vec(s_emb, item_emb) if s_emb is not None and item_emb is not None else 0.0,
             'target_emb_sim': cosine_vec(s_emb, target_emb) if s_emb is not None and target_emb is not None else 0.0,
-            'cross_encoder_score': ce_scores.get(sid, 0.0),
             'user_aspect_overlap': aspect_overlap(s_aspects, user_aspects),
-            'metadata_aspect_overlap': aspect_overlap(s_aspects, metadata_aspects),
             'item_aspect_salience': float(item_sal),
             'sentiment_match': float(sent_match),
             'helpfulness_norm': float(cand.get('helpful_vote', 0.0)) / max(1.0, max_help),
@@ -336,26 +275,18 @@ def main():
     ap.add_argument('--aspects', default='data/processed/aspects/sentence_aspects.parquet')
     ap.add_argument('--embeddings', default='embeddings/embeddings.npz')
     ap.add_argument('--output', default='data/processed/pairs')
-    ap.add_argument('--semantic-weight', type=float, default=0.4)
-    ap.add_argument('--aspect-weight', type=float, default=0.3)
-    ap.add_argument('--sentiment-weight', type=float, default=0.2)
-    ap.add_argument('--coverage-weight', type=float, default=0.1)
+    ap.add_argument('--semantic-weight', type=float, default=0.70)
+    ap.add_argument('--aspect-weight', type=float, default=0.15)
+    ap.add_argument('--sentiment-weight', type=float, default=0.10)
+    ap.add_argument('--coverage-weight', type=float, default=0.05)
     ap.add_argument('--num-workers', type=int, default=min(os.cpu_count() or 1, 64),
                      help='Parallel worker processes for per-case feature building (fork-based)')
     ap.add_argument('--batch-size', type=int, default=3000,
-                     help='Cases per batch: cases are streamed and processed in bounded batches, with each '
-                          "batch's rows written to the output parquet immediately (pyarrow.parquet.ParquetWriter, "
-                          'incremental row-groups) instead of accumulating every row for the whole split in memory '
-                          'before one pd.DataFrame(rows) call -- the accumulate-then-build pattern is itself a '
-                          'multi-GB cost (rows list + DataFrame construction holding both at once) on top of the '
-                          'fixed aspects+embeddings baseline, and was the remaining cause of OOM even after fixing '
-                          'the fork/COW dict issues and the astype() copy. Lower this on tighter RAM budgets.')
+                     help='Cases per batch; each batch is written to the output parquet immediately '
+                          '(incremental row-groups) instead of accumulating the whole split in memory. '
+                          'Lower this on tighter RAM budgets.')
     ap.add_argument('--peer-retriever', default='models/peer_target_retriever.pt',
                      help='Checkpoint from scripts/train_peer_retriever.py for the target_emb_sim feature; skipped (feature=0) if missing')
-    ap.add_argument('--cross-encoder', default='models/peer_cross_encoder',
-                     help='Fine-tuned checkpoint dir from scripts/train_cross_encoder.py for the cross_encoder_score feature; skipped (feature=0) if missing')
-    ap.add_argument('--cross-encoder-topn', type=int, default=50,
-                     help='Only cross-encode the top-N candidates per case (ranked by target_emb_sim); too slow to run on the full pool')
     args = ap.parse_args()
 
     out_dir = ensure_dir(args.output)
@@ -373,15 +304,6 @@ def main():
     else:
         _W['peer_retriever'] = None
         print(f'WARNING: no retriever checkpoint at {retriever_path}; target_emb_sim will be 0 for all rows')
-    ce_path = Path(args.cross_encoder)
-    if ce_path.exists():
-        from sentence_transformers.cross_encoder import CrossEncoder
-        _W['cross_encoder'] = CrossEncoder(str(ce_path), device='cpu')
-        _W['cross_encoder_topn'] = args.cross_encoder_topn
-        print(f'Loaded cross-encoder reranker from {ce_path} (top-{args.cross_encoder_topn}/case)')
-    else:
-        _W['cross_encoder'] = None
-        print(f'WARNING: no cross-encoder checkpoint at {ce_path}; cross_encoder_score will be 0 for all rows')
     _W['weights'] = {
         'semantic': args.semantic_weight,
         'aspect': args.aspect_weight,

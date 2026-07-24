@@ -1,38 +1,38 @@
 {
-    "narre": {
-        "kind": "review-attention rating model, task-adapted to sentence scoring",
-        "paper": "Chen, Zhang, Liu, Ma. Neural Attentional Rating Regression with Review-level Explanations. WWW 2018.",
-        "official_repo": "https://github.com/chenchongthu/NARRE",
-        "mechanism": "Real trained CNN+two-sided-attention network (baselines/published/neural/narre.py, ported from the official TF1 model.py), trained on rating regression over a temporal-safe, 5-core-filtered review corpus per dataset (scripts/train_published_neural.py). PEER scores each candidate review with NARRE's item-side attention weight, whose context is that review's author -- the paper's own review-usefulness signal, applied directly to PEER's candidate pool instead of the paper's own held-out review set.",
-        "adaptation_notes": "Single shared word-embedding table for user/item text (paper uses two independently-sized tables for the same underlying vocabulary). Rating-prediction head (NCF interaction + biases) is trained but unused at PEER inference time -- only the attention sub-network is queried.",
-        "exact_official_reproduction": false
-    },
-    "hrdr": {
-        "kind": "rating-pattern-guided review-attention model, task-adapted to sentence scoring",
-        "paper": "Liu, Wang, Peng, Wu, Gan, Pan, Jiao. Hybrid neural recommendation with joint deep representation learning of ratings and reviews. Neurocomputing 374 (2020): 77-85.",
-        "official_repo": "https://github.com/cspjiao/HDRL",
-        "mechanism": "Real trained CNN+attention network (baselines/published/neural/hrdr.py, ported from the official PyTorch source), attention context = an MLP over the (frozen) user-item rating matrix row/column, trained on rating regression over the same temporal-safe, 5-core corpus as NARRE. PEER scores each candidate review with the item tower's attention weight (context = the target item's rating-matrix column).",
-        "adaptation_notes": "The released repo excerpt we could inspect does not include the prediction head (models/prediction.py); we implemented a standard NCF-style head (dot-product + user/item/global bias) in the same spirit as NARRE's, documented as our own completion of that missing piece -- unused at PEER inference time, same as NARRE.",
-        "exact_official_reproduction": false
-    },
-    "a2spr": {
-        "kind": "aspect-sentiment vector similarity (not a neural model)",
-        "paper": "Huang et al. 2020. Personalized Review Recommendation based on Users' Aspect Sentiment.",
-        "mechanism": "Cosine similarity between the candidate sentence's per-aspect sentiment vector and the target user's aspect-sentiment profile built from their review history (peer/aspect_sentiment.py). Aspect assignment reuses PEER's own upstream aspect extraction/canonicalization instead of the paper's TF-IDF step.",
-        "exact_official_reproduction": false
-    },
-    "erra_r": {
-        "kind": "personalized dense retrieval + aspect-salience boost, task-adapted to sentence scoring",
-        "paper": "Explainable Recommendation with Personalized Review Retrieval and Aspect Learning. ACL 2023 (arXiv:2306.12657).",
-        "mechanism": "Dense retrieval: cosine similarity between each candidate sentence's embedding and a (user-history + metadata) query embedding, boosted for candidates covering the (user,item) pair's top-n most salient shared aspects.",
-        "adaptation_notes": "The paper's explanation-generation stage (final step after retrieval) does not apply to PEER's selection task and is not reproduced.",
-        "exact_official_reproduction": false
-    },
-    "prag": {
-        "kind": "small trained personalized retriever, task-adapted to sentence scoring",
-        "paper": "Xie, Singh, McAuley, Majumder. Factual and Informative Review Generation for Explainable Recommendation. EMNLP 2023 (arXiv:2209.12613).",
-        "mechanism": "A small MLP (scripts/train_prag_retriever.py) trained to estimate the target review's embedding from (user-history, metadata) embeddings; candidates are ranked by cosine similarity to that estimate -- the paper's retriever mechanism at a scale that fits this project.",
-        "adaptation_notes": "The paper's retriever uses transformer blocks over a much larger training corpus; architecture details beyond the abstract were not available to us, so this is a deliberately scaled-down stand-in for the same mechanism, not a claim of matching the paper's retriever exactly. The generator stage is not applicable to PEER's selection task.",
-        "exact_official_reproduction": false
-    }
+  "narre": {
+    "kind": "review-attention rating model, task-adapted to sentence scoring",
+    "paper": "Chen, Zhang, Liu, Ma. Neural Attentional Rating Regression with Review-level Explanations. WWW 2018.",
+    "official_repo": "https://github.com/chenchongthu/NARRE",
+    "mechanism": "Real trained CNN+two-sided-attention network (baselines/published/neural/narre.py, ported from the official TF1 model.py), trained on rating regression over a temporal-safe, 5-core-filtered review corpus per dataset (scripts/train_published_neural.py). PEER scores each candidate review with NARRE's item-side attention weight, whose context is that review's author -- the paper's own review-usefulness signal, applied directly to PEER's candidate pool instead of the paper's own held-out review set.",
+    "adaptation_notes": "Single shared word-embedding table for user/item text (paper uses two independently-sized tables for the same underlying vocabulary). Rating-prediction head (NCF interaction + biases) is trained but unused at PEER inference time -- only the attention sub-network is queried.",
+    "exact_official_reproduction": false
+  },
+  "hrdr": {
+    "kind": "rating-pattern-guided review-attention model, task-adapted to sentence scoring",
+    "paper": "Liu, Wang, Peng, Wu, Gan, Pan, Jiao. Hybrid neural recommendation with joint deep representation learning of ratings and reviews. Neurocomputing 374 (2020): 77-85.",
+    "official_repo": "https://github.com/cspjiao/HDRL",
+    "mechanism": "Real trained CNN+attention network (baselines/published/neural/hrdr.py, ported from the official PyTorch source), attention context = an MLP over the (frozen) user-item rating matrix row/column, trained on rating regression over the same temporal-safe, 5-core corpus as NARRE. PEER scores each candidate review with the item tower's attention weight (context = the target item's rating-matrix column).",
+    "adaptation_notes": "The released repo excerpt we could inspect does not include the prediction head (models/prediction.py); we implemented a standard NCF-style head (dot-product + user/item/global bias) in the same spirit as NARRE's, documented as our own completion of that missing piece -- unused at PEER inference time, same as NARRE.",
+    "exact_official_reproduction": false
+  },
+  "a2spr": {
+    "kind": "aspect-sentiment vector similarity (not a neural model)",
+    "paper": "Huang et al. 2020. Personalized Review Recommendation based on Users' Aspect Sentiment.",
+    "mechanism": "Cosine similarity between the candidate sentence's per-aspect sentiment vector and the target user's aspect-sentiment profile built from their review history (peer/aspect_sentiment.py). Aspect assignment reuses PEER's own upstream aspect extraction/canonicalization instead of the paper's TF-IDF step.",
+    "exact_official_reproduction": false
+  },
+  "erra_r": {
+    "kind": "personalized dense retrieval + aspect-salience boost, task-adapted to sentence scoring",
+    "paper": "Explainable Recommendation with Personalized Review Retrieval and Aspect Learning. ACL 2023 (arXiv:2306.12657).",
+    "mechanism": "Dense retrieval: cosine similarity between each candidate sentence's embedding and a (user-history + metadata) query embedding, boosted for candidates covering the (user,item) pair's top-n most salient shared aspects.",
+    "adaptation_notes": "The paper's explanation-generation stage (final step after retrieval) does not apply to PEER's selection task and is not reproduced.",
+    "exact_official_reproduction": false
+  },
+  "prag": {
+    "kind": "small trained personalized retriever, task-adapted to sentence scoring",
+    "paper": "Xie, Singh, McAuley, Majumder. Factual and Informative Review Generation for Explainable Recommendation. EMNLP 2023 (arXiv:2209.12613).",
+    "mechanism": "A small MLP (scripts/train_prag_retriever.py) trained to estimate the target review's embedding from (user-history, metadata) embeddings; candidates are ranked by cosine similarity to that estimate -- the paper's retriever mechanism at a scale that fits this project.",
+    "adaptation_notes": "The paper's retriever uses transformer blocks over a much larger training corpus; architecture details beyond the abstract were not available to us, so this is a deliberately scaled-down stand-in for the same mechanism, not a claim of matching the paper's retriever exactly. The generator stage is not applicable to PEER's selection task.",
+    "exact_official_reproduction": false
+  }
 }

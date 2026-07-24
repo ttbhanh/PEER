@@ -7,50 +7,9 @@ import joblib
 import numpy as np
 import pandas as pd
 
-# metadata_sem_sim / metadata_aspect_overlap deliberately excluded: an ablation
-# (results/ablation.csv, no_metadata variant) showed their contribution to
-# sem_f1/aspect_f1 was within +-0.003 of peer_full (noise), so the product-
-# metadata (title/brand/category) signal is dropped from PEER's own ranker;
-# build_features.py still computes those two columns for anyone re-running
-# that ablation, they're just no longer in the canonical feature set.
-# target_emb_sim: cosine(candidate, estimated target-review embedding) from a
-# small PRAG-style retriever conditioned on (user, item) -- see
-# scripts/train_peer_retriever.py. Added specifically to close PEER's sem_f1
-# gap against the PRAG baseline, whose whole mechanism is ranking by similarity
-# to exactly this kind of estimate; here it's one ranker feature among others,
-# not the sole ranking criterion.
-# cross_encoder_score: a MiniLM cross-encoder (scripts/train_cross_encoder.py)
-# fine-tuned to regress max-sentence-level ground-truth similarity, trained on
-# hard negatives mined from the ORIGINAL PRAG retriever's own top-ranked-but-
-# wrong candidates. build_features.py still computes it (for anyone re-running
-# this experiment), but it's deliberately EXCLUDED here: a controlled A/B test
-# (same data/weights, this column on vs. off) on the valid split showed it
-# *regressed* sem_f1 (0.4200 -> 0.4167) despite slightly improving redundancy --
-# the opposite of its purpose. Likely causes, in rough order of suspicion: (a)
-# the ranker backend is RandomForest, not LightGBM (LightGBM's macOS wheel needs
-# libomp, which isn't loadable here without a system-wide Homebrew path fix
-# outside this project's scope -- see git history for scripts/train_ltr.py) --
-# RF's greedy per-tree splits may handle this feature's sparsity (populated for
-# only the top-50/case candidates, 0 elsewhere) worse than boosting would; (b)
-# the training set (~50k pairs, mostly extremes: strong positives + PRAG-hard-
-# negatives) may not represent the "ordinary middle" of the candidate
-# distribution well enough for the model to rank it reliably at inference time.
-# sentiment_match EXCLUDED as of the sentiment-leak fix: scripts/build_features.py
-# computes this column as max(sentiment_match(candidate, gt) for gt in
-# ground_truth_sentences) -- i.e. it encodes whether the candidate's sentiment
-# matches the ACTUAL TARGET REVIEW's sentiment, which only exists for the label
-# (composite regression target, train-time only). Unlike semantic_to_gt /
-# aspect_match_to_gt (the other two ground-truth-derived label ingredients,
-# already correctly excluded here), sentiment_match had also been left in
-# FEATURE_COLUMNS_DEFAULT -- a genuine target/label leak into a ranker feature,
-# not just the "temporal leakage" (future-review candidates) this project
-# otherwise guards carefully against. Measured impact was small (1.6% feature
-# importance in the pre-fix model, the lowest of the 10 features) and no other
-# baseline reads this column, so the leak wasn't a large driver of PEER's
-# reported wins -- but the feature set is fixed here regardless, since the
-# correctness issue matters independent of its measured magnitude.
-# build_features.py still computes and stores the column (both for the label
-# formula, which legitimately needs it, and for anyone auditing the leak).
+# The 9 ranker features described in the paper (semantic x3, aspect x2,
+# context x4). Product-metadata and cross-encoder-reranker variants were
+# tried during development and are not part of the reported model.
 FEATURE_COLUMNS_DEFAULT = [
     'user_sem_sim', 'item_sem_sim', 'target_emb_sim', 'user_aspect_overlap',
     'item_aspect_salience',
@@ -104,6 +63,8 @@ class RankerModel:
             except Exception:
                 if self.backend == 'lightgbm':
                     raise
+        # Fallback if LightGBM is unavailable (e.g. missing OpenMP runtime on
+        # some macOS setups). Not what the paper's reported numbers use.
         from sklearn.ensemble import RandomForestRegressor
         self.model = RandomForestRegressor(n_estimators=100, max_depth=12, min_samples_leaf=3, random_state=42, n_jobs=-1)
         self.model.fit(x, y)
