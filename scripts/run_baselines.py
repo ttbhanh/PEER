@@ -17,11 +17,12 @@ try:
     from rank_bm25 import BM25Okapi
 except Exception:
     class BM25Okapi:
-        """Minimal BM25 fallback if rank_bm25 isn't installed."""
         def __init__(self, tokenized_corpus, k1=1.5, b=0.75):
             import math
             from collections import Counter
-            self.k1, self.b = k1, b
+            self.corpus = tokenized_corpus
+            self.k1 = k1
+            self.b = b
             self.doc_len = [len(d) for d in tokenized_corpus]
             self.avgdl = sum(self.doc_len) / max(1, len(self.doc_len))
             self.freqs = [Counter(d) for d in tokenized_corpus]
@@ -30,7 +31,6 @@ except Exception:
                 df.update(set(d))
             n = max(1, len(tokenized_corpus))
             self.idf = {t: math.log(1 + (n - c + 0.5) / (c + 0.5)) for t, c in df.items()}
-
         def get_scores(self, query_tokens):
             scores = []
             for f, dl in zip(self.freqs, self.doc_len):
@@ -46,14 +46,12 @@ except Exception:
             return scores
 from tqdm import tqdm
 
-from peer.selectors import resolve_k, topk
+from peer.selectors import resolve_k, topk, mmr_select
 from peer.text import tokenize
 from peer.utils import ensure_dir, write_jsonl
 
-METHODS = ['random', 'popular', 'recent', 'bm25_user', 'sbert_user']
 
-
-def load_embeddings(path: str | None):
+def load_embeddings(path: str | None, needed_ids: set[str] | None = None):
     if not path:
         return {}
     p = Path(path)
@@ -63,15 +61,24 @@ def load_embeddings(path: str | None):
     emb = np.load(npy_path, mmap_mode='r')
     with open(p.with_suffix('.ids.json')) as f:
         ids = json.load(f)
-    return {str(ids[i]): emb[i] for i in range(len(ids))}
+    if needed_ids is None:
+        return {str(ids[i]): emb[i] for i in range(len(ids))}
+    return {str(sid): emb[i] for i, sid in enumerate(ids) if sid in needed_ids}
 
 
 def to_list(x):
     if x is None:
         return []
-    if isinstance(x, (list, tuple, set, np.ndarray)):
+    if isinstance(x, (list, tuple, set)):
         return list(x)
     try:
+        import numpy as np
+        if isinstance(x, np.ndarray):
+            return x.tolist()
+    except Exception:
+        pass
+    try:
+        import pandas as pd
         if pd.isna(x):
             return []
     except Exception:
@@ -80,7 +87,13 @@ def to_list(x):
 
 
 def parse_k_list(values):
-    return ['user_avg' if str(v).lower() in {'user_avg', 'user_avg_k', 'user'} else int(v) for v in values]
+    out = []
+    for v in values:
+        if str(v).lower() in {'user_avg', 'user_avg_k', 'user'}:
+            out.append('user_avg')
+        else:
+            out.append(int(v))
+    return out
 
 
 def method_scores(method: str, group: pd.DataFrame) -> np.ndarray:
@@ -93,10 +106,22 @@ def method_scores(method: str, group: pd.DataFrame) -> np.ndarray:
         return group.get('recency_norm', pd.Series(np.zeros(n))).values.astype(float)
     if method == 'sbert_user':
         return group['user_sem_sim'].values.astype(float)
-    if method == 'bm25_user':
+    if method == 'sbert_metadata':
+        return group['metadata_sem_sim'].values.astype(float)
+    if method == 'sbert_user_metadata':
+        return 0.5 * group['user_sem_sim'].values.astype(float) + 0.5 * group['metadata_sem_sim'].values.astype(float)
+    if method == 'item_salience':
+        return group['item_aspect_salience'].values.astype(float)
+    if method in {'bm25_user', 'bm25_metadata', 'bm25_user_metadata'}:
         tokenized = [tokenize(t) for t in group['text'].tolist()]
         bm25 = BM25Okapi(tokenized)
-        q_toks = tokenize(' '.join(to_list(group.iloc[0].get('user_aspects'))))
+        first = group.iloc[0]
+        q = []
+        if method in {'bm25_user', 'bm25_user_metadata'}:
+            q.extend(to_list(first.get('user_aspects')))
+        if method in {'bm25_metadata', 'bm25_user_metadata'}:
+            q.extend(to_list(first.get('metadata_aspects')))
+        q_toks = tokenize(' '.join(q))
         return np.asarray(bm25.get_scores(q_toks), dtype=float) if q_toks else np.zeros(n)
     raise ValueError(f'Unknown baseline method: {method}')
 
@@ -136,9 +161,9 @@ def prediction_row(case_id, dataset, method, kname, selected, group):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--pairs-dir', default='data/processed/pairs')
-    ap.add_argument('--split', default='test', choices=['train', 'valid', 'test'])
-    ap.add_argument('--methods', nargs='+', default=METHODS)
-    ap.add_argument('--k-list', nargs='+', default=['1', '3', '5', 'user_avg'])
+    ap.add_argument('--split', default='test', choices=['train','valid','test'])
+    ap.add_argument('--methods', nargs='+', default=['random','popular','recent','bm25_user','bm25_metadata','sbert_user','sbert_metadata','sbert_user_metadata','mmr_user_metadata'])
+    ap.add_argument('--k-list', nargs='+', default=['1','3','5','user_avg'])
     ap.add_argument('--embeddings', default='embeddings/embeddings.npz')
     ap.add_argument('--output', default='outputs/predictions/baselines')
     ap.add_argument('--seed', type=int, default=42)
@@ -147,17 +172,22 @@ def main():
     np.random.seed(args.seed)
     out_dir = ensure_dir(args.output)
     df = pd.read_parquet(Path(args.pairs_dir) / f'{args.split}.parquet')
-    embs = load_embeddings(args.embeddings)
+    needed_ids = set(df['sentence_id'].astype(str))
+    embs = load_embeddings(args.embeddings, needed_ids)
     k_list = parse_k_list(args.k_list)
 
     for method in args.methods:
+        effective = 'sbert_user_metadata' if method == 'mmr_user_metadata' else method
         preds = []
-        for (case_id, dataset), group in tqdm(df.groupby(['case_id', 'dataset']), desc=method):
-            scores = method_scores(method, group)
+        for (case_id, dataset), group in tqdm(df.groupby(['case_id','dataset']), desc=f'{method}'):
+            scores = method_scores(effective, group)
             cands = group_to_candidates(group, scores, embs)
             for kv in k_list:
                 k = resolve_k(kv, int(group.iloc[0].get('user_avg_k', 3)), len(cands))
-                selected = topk(cands, k)
+                if method.startswith('mmr'):
+                    selected = mmr_select(cands, k, lambda_rel=0.7)
+                else:
+                    selected = topk(cands, k)
                 preds.append(prediction_row(case_id, dataset, method, kv, selected, group))
         path = out_dir / f'{method}_{args.split}.jsonl'
         write_jsonl(preds, path)

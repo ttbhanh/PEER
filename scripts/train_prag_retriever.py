@@ -1,17 +1,10 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
-"""PRAG (Xie et al., EMNLP 2023 -- arXiv:2209.12613) proposes a *personalized
-retriever* that, given a (user, item) pair, estimates a target-review embedding
-via transformer blocks over user/item/review embeddings, then retrieves reviews
-close to that estimate as evidence for a downstream generator. We reproduce the
-retriever's *mechanism* -- estimate a target-review embedding from a personalized
-query, rank candidates by similarity to it -- at a scale that fits this project: a
-small MLP instead of the paper's transformer blocks (their architecture isn't
-published in enough detail to port 1:1, and is sized for a much larger training
-corpus than we have here). This is a deliberate, documented simplification, not a
-claim of matching the paper's retriever exactly. The generator stage is not
-applicable to PEER's selection task and is not reproduced."""
+"""PRAG (Xie et al., EMNLP 2023) baseline retriever mechanism: estimate a
+target-review embedding from (user, metadata) via a small MLP (a scaled-down
+stand-in for the paper's transformer blocks), rank candidates by similarity
+to it. The generator stage does not apply to PEER's selection task."""
 
 import sys
 from pathlib import Path as _ProjectPath
@@ -29,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from peer.utils import ensure_dir, read_jsonl
+from peer.utils import ensure_dir, read_jsonl, resolve_cases_path
 
 
 class PragRetriever(nn.Module):
@@ -49,11 +42,7 @@ class PragRetriever(nn.Module):
 
 
 def load_embeddings(path: str) -> dict[str, np.ndarray]:
-    # A plain .npy file (unlike .npz, even uncompressed) is mmap-able, so the
-    # multi-GB embeddings array is paged in from disk on demand (reclaimable
-    # page cache) instead of fully materialized as anon RAM -- see
-    # peer/embeddings.py::_npy_and_ids_paths for why.
-    p = Path(path)
+    p = Path(path)  # mmap'd .npy + ids.json, see peer/embeddings.py
     emb = np.load(p.with_suffix('.npy'), mmap_mode='r')
     with open(p.with_suffix('.ids.json')) as f:
         ids = json.load(f)
@@ -88,8 +77,8 @@ def main():
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
 
     embs = load_embeddings(args.embeddings)
-    train_u, train_m, train_y = build_dataset(f'{args.cases}/cases_train.jsonl', embs)
-    valid_u, valid_m, valid_y = build_dataset(f'{args.cases}/cases_valid.jsonl', embs)
+    train_u, train_m, train_y = build_dataset(resolve_cases_path(args.cases, 'train'), embs)
+    valid_u, valid_m, valid_y = build_dataset(resolve_cases_path(args.cases, 'valid'), embs)
     emb_dim = train_u.shape[1]
     print(f'train={len(train_u)} valid={len(valid_u)} emb_dim={emb_dim}')
 

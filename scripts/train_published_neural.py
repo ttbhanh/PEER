@@ -18,11 +18,11 @@ import torch.nn as nn
 from baselines.published.neural.data import RatingCorpus, kcore_filter, load_temporal_safe_pool, cap_by_user, cap_entities, tokenize_records
 from baselines.published.neural.narre import NARRE
 from baselines.published.neural.hrdr import HRDR
-from peer.utils import ensure_dir, read_jsonl
+from peer.utils import ensure_dir, read_jsonl, resolve_cases_path
 
 
 def temporal_cutoff(cases_dir: str, dataset: str) -> int:
-    p = Path(cases_dir) / 'cases_test.jsonl'
+    p = resolve_cases_path(cases_dir, 'test')
     ts = [c['timestamp'] for c in read_jsonl(p) if c['dataset'] == dataset]
     if not ts:
         raise ValueError(f'No test cases found for dataset={dataset} in {p}')

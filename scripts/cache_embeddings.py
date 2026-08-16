@@ -11,15 +11,15 @@ from pathlib import Path
 from tqdm import tqdm
 
 from peer.embeddings import TextEmbedder, save_embeddings
-from peer.utils import ensure_dir, read_jsonl
+from peer.utils import ensure_dir, read_jsonl, resolve_cases_path
 
 
 def collect_texts(cases_dir: Path):
     rows = []
     seen = set()
     for split in ['train', 'valid', 'test']:
-        p = cases_dir / f'cases_{split}.jsonl'
-        if not p.exists():
+        p = resolve_cases_path(cases_dir, split)
+        if p is None:
             continue
         for c in read_jsonl(p):
             for cand in c['candidate_sentences']:
@@ -50,11 +50,6 @@ def main():
     args = ap.parse_args()
 
     rows = collect_texts(Path(args.cases))
-    # Sort by length before batching: candidate sentences (a few words) and
-    # profile/metadata blobs (up to ~2048 chars) are interleaved in file order,
-    # so a naive batch mixes wildly different lengths and every short sentence
-    # gets padded up to the longest text in its batch. Order doesn't matter for
-    # correctness since we save embeddings keyed by id, not by position.
     rows = sorted(rows, key=lambda r: len(r[1]))
     ids = [r[0] for r in rows]
     texts = [r[1] for r in rows]

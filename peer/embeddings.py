@@ -60,11 +60,6 @@ class TextEmbedder:
             n = len(texts)
             dim = self.model.get_sentence_embedding_dimension()
             out = np.empty((n, dim), dtype=np.float32)
-            # Encode in large chunks (not one call for the whole corpus): keeps peak
-            # memory bounded to one chunk instead of accumulating a Python list of
-            # per-batch arrays and concatenating at the end, and prints progress we
-            # explicitly flush -- the library's own progress bar can appear to hang
-            # when stdout is redirected to a file for a long (tens of minutes) run.
             chunk_size = max(batch_size * 4, 2000)
             for start in range(0, n, chunk_size):
                 end = min(n, start + chunk_size)
@@ -93,11 +88,8 @@ class TextEmbedder:
 
 def _npy_and_ids_paths(path: str | Path) -> tuple[Path, Path]:
     """embeddings.npz -> (embeddings.npy, embeddings.ids.json). A plain .npy
-    array file (not zip-wrapped like .npz, even uncompressed) is the only
-    format numpy can actually mmap -- np.load(path, mmap_mode='r') on a .npz
-    member always fully materializes it in RAM regardless of mmap_mode,
-    since a zip entry isn't a directly-mappable OS file. Splitting the (small)
-    ids list into its own JSON file keeps the big array file mmap-clean."""
+    file (unlike .npz) is mmap-able; ids are split into their own JSON file
+    to keep the big array file mmap-clean."""
     path = Path(path)
     return path.with_suffix('.npy'), path.with_suffix('.ids.json')
 

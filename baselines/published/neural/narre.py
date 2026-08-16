@@ -42,8 +42,6 @@ class NARRE(nn.Module):
         self.cnn = _ReviewCNN(embedding_size, num_filters, filter_sizes)
         num_filters_total = num_filters * len(filter_sizes)
 
-        # attention-context ID tables (distinct from the latent-factor tables below,
-        # matching the original code's separate uidW/iidW vs uidmf/iidmf)
         self.att_user_id = nn.Embedding(n_users + 1, embedding_id)
         self.att_item_id = nn.Embedding(n_items + 1, embedding_id)
 

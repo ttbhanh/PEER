@@ -6,20 +6,21 @@ scikit-learn>=1.4
 scipy>=1.11
 tqdm>=4.66
 joblib>=1.3
+pyyaml>=6.0
 
 # NLP / retrieval
 spacy>=3.7
 rank-bm25>=0.2.2
+nltk>=3.8
+rouge-score>=0.1.2
+sacrebleu>=2.4
 
-# GPU: sentence embeddings, NARRE/HRDR training, PEER/PRAG retriever training
+# Optional but recommended for GPU runs
 sentence-transformers>=3.0
 transformers>=4.43
 accelerate>=0.33
 torch>=2.7
 
-# Learning-to-rank ranker backend. Falls back to scikit-learn RandomForest if
-# unavailable (not what the paper's reported numbers use).
+# Optional learning-to-rank. Code falls back to sklearn if unavailable.
 lightgbm>=4.3
-
-# Only needed for scripts/independent_check.py aspect
-yake>=0.4.8
+xgboost>=2.0

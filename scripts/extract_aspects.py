@@ -15,13 +15,13 @@ import pandas as pd
 from tqdm import tqdm
 
 from peer.aspects import extract_aspect_phrases, normalize_aspects_by_frequency, build_profile_aspects
-from peer.utils import ensure_dir, read_jsonl, write_jsonl
+from peer.utils import ensure_dir, read_jsonl, resolve_cases_path, write_jsonl
 
 
 def iter_cases(cases_dir: Path):
     for split in ['train', 'valid', 'test']:
-        path = cases_dir / f'cases_{split}.jsonl'
-        if path.exists():
+        path = resolve_cases_path(cases_dir, split)
+        if path is not None:
             for c in read_jsonl(path):
                 yield split, c
 
@@ -76,9 +76,6 @@ def main():
         per_row_aspects = [_extract_task(t) for t in tqdm(tasks)]
     else:
         chunksize = max(1, min(2000, len(tasks) // (n_workers * 20) or 1))
-        # spawn (not fork): forking after spaCy/thinc/blis have touched their own
-        # thread pools can deadlock workers on macOS, and spawn is the safe choice
-        # on every platform for a C-extension-heavy library like spaCy.
         ctx = mp.get_context('spawn')
         with ctx.Pool(processes=n_workers, initializer=_init_worker, initargs=(args.method,)) as pool:
             per_row_aspects = list(tqdm(pool.imap(_extract_task, tasks, chunksize=chunksize), total=len(tasks)))

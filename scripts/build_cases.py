@@ -7,6 +7,7 @@ sys.path.insert(0, str(_ProjectPath(__file__).resolve().parents[1]))
 
 import argparse
 import gc
+import gzip
 import json
 import multiprocessing as mp
 import os
@@ -58,10 +59,8 @@ def infer_file(raw_dir: Path, dataset: str, kind: str) -> Path:
 
 
 def _code_of(s: str, code_map: dict[str, int], lookup: list[str]) -> int:
-    """Intern a string into a small integer code, so the hot path (per-candidate
-    scanning) never touches Python string objects -- only numpy ints, which avoids
-    the fork copy-on-write blowup that comes from CPython refcounting every string
-    a worker process reads from data shared with the parent."""
+    """Intern a string to a small int code, to avoid fork copy-on-write memory
+    blowup from refcounting Python strings in worker processes."""
     c = code_map.get(s)
     if c is None:
         c = len(lookup)
@@ -72,21 +71,9 @@ def _code_of(s: str, code_map: dict[str, int], lookup: list[str]) -> int:
 
 class _SentenceStore:
     """Read-only per-review sentence-text lookup backed by one shared string
-    buffer + integer offset arrays, instead of a list[list[str]] holding one
-    Python string object per sentence. This is read by forked worker processes
-    (_process_user, via multiprocessing.Pool below): CPython bumps the refcount
-    of every object a read touches, which forces copy-on-write page duplication
-    per touched string object even for a pure read. Candidate-sentence
-    construction touches sentences_arr[ix] once per candidate REVIEW considered
-    (before the max-candidate-sentences truncation), for every (user, target
-    position) pair scanned -- on a large raw file (e.g. millions of reviews)
-    with many workers, that is enough touches to multiply resident memory past
-    the raw text's own size and OOM the host (confirmed in practice: this was
-    the actual root cause of an OOM crash on a 20M-review dataset). A shared
-    string's characters aren't touched by per-element Python refcounting the
-    way list-of-string elements are, so slicing into one big buffer doesn't
-    trigger the same blowup -- only the numeric offset arrays (numpy, not
-    per-element Python objects) pay that (much smaller) cost."""
+    buffer + integer offset arrays, instead of list[list[str]] (one Python
+    object per sentence) -- avoids fork copy-on-write memory blowup when many
+    worker processes read it repeatedly."""
     __slots__ = ('text', 'starts', 'ends', 'review_start', 'review_count')
 
     def __init__(self, text: str, starts: np.ndarray, ends: np.ndarray,
@@ -108,15 +95,8 @@ class _SentenceStore:
 
 class _GroupIndex:
     """Read-only int -> [int, ...] group lookup (e.g. item_code -> review row
-    indices) backed by one sorted index array + integer offsets (CSR layout),
-    instead of a dict[int, list[int]] holding one Python list + one Python int
-    object per entry. Same fork/COW rationale as _SentenceStore above: this is
-    looked up once per (user, target position) pair scanned in _process_user
-    (to find candidate reviews for the target item), and for popular items
-    that list can be long -- across millions of scanned positions and many
-    workers, that is dense enough traffic to matter. Slicing a shared numpy
-    array returns a *view* (no data copy, and no per-element Python refcount
-    touch on pre-existing objects), unlike iterating a shared Python list."""
+    indices), backed by a sorted index array + offsets (CSR layout) instead
+    of dict[int, list[int]] -- same fork/COW rationale as _SentenceStore."""
     __slots__ = ('sorted_idx', 'offsets')
 
     def __init__(self, sorted_idx: np.ndarray, offsets: np.ndarray):
@@ -133,9 +113,7 @@ class _GroupIndex:
 
 
 def _stream_metadata(path: Path, item_col: str, max_rows: int | None) -> dict[str, str]:
-    """Read metadata line by line, keep only the resolved item_id -> compact text
-    string per row; never materializes the full (often image/video-heavy) record
-    list in memory at once."""
+    """Read metadata line by line, keeping only item_id -> compact text."""
     meta_map: dict[str, str] = {}
     with open(path, 'r', encoding='utf-8') as f:
         for i, line in enumerate(f):
@@ -152,12 +130,9 @@ def _stream_metadata(path: Path, item_col: str, max_rows: int | None) -> dict[st
 
 
 def _load_reviews_arrays(args, dataset: str, review_path: Path):
-    """Stream-parse the reviews JSONL directly into compact arrays: numpy for
-    numeric fields, integer codes (+ small lookup tables) for user/item ids, and
-    plain lists only for the sentence text that downstream steps actually need.
-    This avoids ever holding one Python dict per raw review (with unused fields
-    like images/title/verified_purchase) in memory, which is what a
-    read-everything-into-a-DataFrame loader would do."""
+    """Stream-parse reviews JSONL into compact arrays (numpy for numeric
+    fields, int codes for user/item ids) instead of one Python dict per raw
+    review, to keep memory bounded on large files."""
     user_col, item_col, text_col = args.user_col, args.item_col, args.text_col
     rating_col, ts_col, helpful_col = args.rating_col, args.timestamp_col, args.helpful_col
 
@@ -166,12 +141,6 @@ def _load_reviews_arrays(args, dataset: str, review_path: Path):
     helpful_list: list[float] = []
     user_code_list: list[int] = []
     item_code_list: list[int] = []
-    # Sentence text is accumulated as flat fragments + offsets (not list[list[str]])
-    # so the *shared, post-fork* representation (built below, after this loop) is
-    # one big string + numpy offset arrays rather than millions of individual
-    # Python string objects -- see _SentenceStore. text_parts/sent_starts_list/
-    # sent_ends_list are transient, single-process-only scratch space; nothing
-    # here is shared with workers yet, so ordinary Python lists are fine.
     text_parts: list[str] = []
     sent_starts_list: list[int] = []
     sent_ends_list: list[int] = []
@@ -246,11 +215,9 @@ _W: dict[str, Any] = {}
 
 
 def _process_user(item: tuple[int, np.ndarray]) -> list[dict[str, Any]]:
-    """Build every eligible case for one user. Runs in a forked worker process;
-    reads shared read-only arrays set up in _W by the parent before Pool creation
-    (relies on copy-on-write fork semantics, so no per-task pickling of the dataset).
-    All hot-path comparisons use numpy scalars / int codes, not Python strings, to
-    keep copy-on-write memory growth bounded across many worker processes."""
+    """Build every eligible case for one user. Runs in a forked worker process,
+    reading shared read-only arrays set up in _W by the parent (relies on
+    copy-on-write fork semantics, so no per-task pickling of the dataset)."""
     u_code, idxs = item
     ts_arr = _W['ts_arr']; item_code_arr = _W['item_code_arr']; user_code_arr = _W['user_code_arr']
     rating_arr = _W['rating_arr']; helpful_arr = _W['helpful_arr']
@@ -326,14 +293,33 @@ def _process_user(item: tuple[int, np.ndarray]) -> list[dict[str, Any]]:
     return out
 
 
+class _DiskStreamCollector:
+    """Streams every offered case to a temp JSONL file on disk instead of
+    accumulating in memory (--max-cases-per-dataset not set): peak RAM is
+    bounded by a lightweight (case_id, timestamp) index, used later to decide
+    the temporal train/valid/test split without re-loading case bodies."""
+
+    def __init__(self, dataset: str, tmp_path: Path):
+        self.dataset = dataset
+        self.tmp_path = tmp_path
+        self._fh = gzip.open(tmp_path, 'wt', encoding='utf-8', compresslevel=4)
+        self._counter = 0
+        self.index: list[tuple[str, int]] = []  # (case_id, timestamp), kept in memory
+
+    def offer(self, case: dict[str, Any]) -> None:
+        case_id = f'{self.dataset}_{self._counter}'
+        self._counter += 1
+        case['case_id'] = case_id
+        self._fh.write(json.dumps(case, ensure_ascii=False) + '\n')
+        self.index.append((case_id, case['timestamp']))
+
+    def close(self) -> None:
+        self._fh.close()
+
+
 class _ReservoirSampler:
-    """Algorithm-R reservoir sampling: yields a uniform random sample of at most
-    `cap` items from a stream of unknown length, using O(cap) memory regardless of
-    how many total eligible cases the raw data would otherwise produce. This is
-    what actually bounds peak memory for --max-cases-per-dataset on full-scale
-    data -- without it, the code would first materialize every eligible case
-    (potentially millions, each holding up to max-candidate-sentences dicts) and
-    only discard the excess at the very end."""
+    """Algorithm-R reservoir sampling: a uniform random sample of at most
+    `cap` items from a stream of unknown length, in O(cap) memory."""
 
     def __init__(self, cap: int | None, rng: random.Random):
         self.cap = cap
@@ -354,7 +340,11 @@ class _ReservoirSampler:
                 self.reservoir[j] = case
 
 
-def build_dataset_cases(args, dataset: str, rng: random.Random) -> list[dict[str, Any]]:
+def build_dataset_cases(args, dataset: str, rng: random.Random, tmp_dir: Path | None = None):
+    """Returns ('memory', dataset, None, cases) if --max-cases-per-dataset is
+    set (cases held in memory), else ('streamed', dataset, tmp_path, index)
+    with every case written to tmp_path and index the lightweight
+    [(case_id, timestamp), ...] list main() uses to decide the split."""
     raw_dir = Path(args.raw_dir)
     review_path = Path(args.reviews) if args.reviews else infer_file(raw_dir, dataset, 'reviews')
     metadata_path = Path(args.metadata) if args.metadata else None
@@ -364,11 +354,13 @@ def build_dataset_cases(args, dataset: str, rng: random.Random) -> list[dict[str
         except FileNotFoundError:
             metadata_path = None
 
+    streaming = args.max_cases_per_dataset is None
+
     print(f'[{dataset}] Loading reviews from {review_path}')
     (ts_arr, rating_arr, helpful_arr, user_code_arr, item_code_arr,
      sentence_store, user_lookup, item_lookup) = _load_reviews_arrays(args, dataset, review_path)
     if len(ts_arr) == 0:
-        return []
+        return ('streamed', dataset, None, []) if streaming else ('memory', dataset, None, [])
     print(f'[{dataset}] {len(ts_arr)} reviews, {len(user_lookup)} users, {len(item_lookup)} items')
 
     meta_map: dict[str, str] = {}
@@ -379,16 +371,6 @@ def build_dataset_cases(args, dataset: str, rng: random.Random) -> list[dict[str
     user_indices: dict[int, list[int]] = defaultdict(list)
     for idx in range(len(user_code_arr)):
         user_indices[int(user_code_arr[idx])].append(idx)
-    # item_indices as CSR (sorted row-index array + integer offsets) instead of
-    # dict[int, list[int]]: this one IS put into _W and read by every forked
-    # worker once per (user, target position) scanned to find candidate reviews
-    # for the target item -- for popular items that list can be long, and across
-    # millions of scanned positions that is dense enough traffic for the same
-    # fork/COW refcount blowup _SentenceStore guards against. user_indices above
-    # does NOT need this treatment: it's only used on the next few lines to build
-    # the per-task argument list handed to the worker pool, never stored in _W,
-    # so each worker only ever sees its own already-pickled (u_code, idxs) task
-    # argument -- not the whole structure.
     n_items = len(item_lookup)
     item_sort_order = np.argsort(item_code_arr, kind='stable').astype(np.int64)
     sorted_item_codes = item_code_arr[item_sort_order]
@@ -418,31 +400,41 @@ def build_dataset_cases(args, dataset: str, rng: random.Random) -> list[dict[str
 
     n_workers = max(1, args.num_workers)
     items = list(user_indices.items())
-    sampler = _ReservoirSampler(args.max_cases_per_dataset, rng)
-    if args.max_cases_per_dataset is None and len(items) > 200_000:
-        print(f'[{dataset}] WARNING: no --max-cases-per-dataset cap set with {len(items)} users; '
-              f'this dataset may produce millions of cases and use a very large amount of memory.')
+    if streaming:
+        assert tmp_dir is not None, 'tmp_dir is required when --max-cases-per-dataset is not set'
+        tmp_path = tmp_dir / f'.tmp_allcases_{dataset}.jsonl.gz'
+        collector: _DiskStreamCollector | _ReservoirSampler = _DiskStreamCollector(dataset, tmp_path)
+        print(f'[{dataset}] No --max-cases-per-dataset cap set; streaming every eligible case to '
+              f'{tmp_path} as it is produced (memory-bounded by a lightweight index, not case content).')
+    else:
+        collector = _ReservoirSampler(args.max_cases_per_dataset, rng)
 
     if n_workers == 1 or len(items) < n_workers * 4:
         for it in tqdm(items, desc=f'[{dataset}] Build temporal cases'):
             for case in _process_user(it):
-                sampler.offer(case)
+                collector.offer(case)
     else:
         chunksize = max(1, min(500, len(items) // (n_workers * 8) or 1))
         ctx = mp.get_context('fork')
         with ctx.Pool(processes=n_workers) as pool:
             for result in tqdm(pool.imap_unordered(_process_user, items, chunksize=chunksize), total=len(items), desc=f'[{dataset}] Build temporal cases ({n_workers}w)'):
                 for case in result:
-                    sampler.offer(case)
-
-    cases = sampler.reservoir
-    for i, c in enumerate(cases):
-        c['case_id'] = f'{dataset}_{i}'
+                    collector.offer(case)
 
     _W.clear()
     del ts_arr, rating_arr, helpful_arr, user_code_arr, item_code_arr, sentence_store, user_indices, item_indices, meta_map
     gc.collect()
-    return cases
+
+    if streaming:
+        collector.close()
+        print(f'[{dataset}] {len(collector.index)} total eligible cases streamed to {collector.tmp_path}')
+        return ('streamed', dataset, collector.tmp_path, collector.index)
+
+    print(f'[{dataset}] {collector.seen} total eligible cases seen (kept {len(collector.reservoir)} via reservoir sampling)')
+    cases = collector.reservoir
+    for i, c in enumerate(cases):
+        c['case_id'] = f'{dataset}_{i}'
+    return ('memory', dataset, None, cases)
 
 
 def assign_splits(cases: list[dict[str, Any]], valid_ratio: float, test_ratio: float) -> list[dict[str, Any]]:
@@ -496,34 +488,97 @@ def main():
     out_dir = ensure_dir(args.output)
     rng = random.Random(args.seed)
 
-    all_cases = []
-    for ds in args.datasets:
-        cases = build_dataset_cases(args, ds, rng)
-        print(f'[{ds}] Built {len(cases)} eligible cases')
-        all_cases.extend(cases)
-    split_cases = []
-    for ds in sorted(set(c['dataset'] for c in all_cases)):
-        ds_cases = [c for c in all_cases if c['dataset'] == ds]
-        split_cases.extend(assign_splits(ds_cases, args.valid_ratio, args.test_ratio))
-    all_cases = split_cases
+    streaming = args.max_cases_per_dataset is None
+    tmp_dir = ensure_dir(out_dir / '.tmp_build_cases') if streaming else None
 
-    for split in ['train', 'valid', 'test']:
-        rows = [c for c in all_cases if c['split'] == split]
-        write_jsonl(rows, out_dir / f'cases_{split}.jsonl')
-        print(f'Wrote {len(rows)} {split} cases -> {out_dir / f"cases_{split}.jsonl"}')
+    results = [build_dataset_cases(args, ds, rng, tmp_dir) for ds in args.datasets]
+
+    if not streaming:
+        all_cases = []
+        for _, ds, _, cases in results:
+            print(f'[{ds}] Built {len(cases)} eligible cases')
+            all_cases.extend(cases)
+        split_cases = []
+        for ds in sorted(set(c['dataset'] for c in all_cases)):
+            ds_cases = [c for c in all_cases if c['dataset'] == ds]
+            split_cases.extend(assign_splits(ds_cases, args.valid_ratio, args.test_ratio))
+        all_cases = split_cases
+
+        for split in ['train', 'valid', 'test']:
+            rows = [c for c in all_cases if c['split'] == split]
+            write_jsonl(rows, out_dir / f'cases_{split}.jsonl.gz')
+            print(f'Wrote {len(rows)} {split} cases -> {out_dir / f"cases_{split}.jsonl.gz"}')
+
+        stats = []
+        for ds in sorted(set(c['dataset'] for c in all_cases)):
+            subset = [c for c in all_cases if c['dataset'] == ds]
+            stats.append({
+                'dataset': ds,
+                'n_cases': len(subset),
+                'n_train': sum(c['split'] == 'train' for c in subset),
+                'n_valid': sum(c['split'] == 'valid' for c in subset),
+                'n_test': sum(c['split'] == 'test' for c in subset),
+                'avg_candidates': sum(len(c['candidate_sentences']) for c in subset) / max(1, len(subset)),
+                'avg_gt_sentences': sum(len(c['ground_truth_sentences']) for c in subset) / max(1, len(subset)),
+                'avg_user_history_sentences': sum(len(c['user_history_sentences']) for c in subset) / max(1, len(subset)),
+            })
+        pd.DataFrame(stats).to_csv(out_dir / 'dataset_stats.csv', index=False)
+        return
+
+    split_map: dict[str, str] = {}
+    for _, ds, _, index in results:
+        idx_sorted = sorted(index, key=lambda x: x[1])
+        n = len(idx_sorted)
+        n_test = int(round(n * args.test_ratio))
+        n_valid = int(round(n * args.valid_ratio))
+        for pos, (case_id, _ts) in enumerate(idx_sorted):
+            if pos < n - n_valid - n_test:
+                split_map[case_id] = 'train'
+            elif pos < n - n_test:
+                split_map[case_id] = 'valid'
+            else:
+                split_map[case_id] = 'test'
+
+    out_handles = {s: gzip.open(out_dir / f'cases_{s}.jsonl.gz', 'wt', encoding='utf-8', compresslevel=4) for s in ['train', 'valid', 'test']}
+    counts = {s: 0 for s in ['train', 'valid', 'test']}
+    stats_acc: dict[str, dict[str, float]] = {}
+    for _, ds, tmp_path, index in results:
+        print(f'[{ds}] Built {len(index)} eligible cases')
+        acc = stats_acc.setdefault(ds, {'n_cases': 0, 'n_train': 0, 'n_valid': 0, 'n_test': 0,
+                                         'sum_candidates': 0, 'sum_gt': 0, 'sum_hist': 0})
+        if tmp_path is None:
+            continue
+        with gzip.open(tmp_path, 'rt', encoding='utf-8') as f:
+            for line in f:
+                case = json.loads(line)
+                split = split_map[case['case_id']]
+                case['split'] = split
+                out_handles[split].write(json.dumps(case, ensure_ascii=False) + '\n')
+                counts[split] += 1
+                acc['n_cases'] += 1
+                acc[f'n_{split}'] += 1
+                acc['sum_candidates'] += len(case['candidate_sentences'])
+                acc['sum_gt'] += len(case['ground_truth_sentences'])
+                acc['sum_hist'] += len(case['user_history_sentences'])
+        tmp_path.unlink()
+
+    for s in ['train', 'valid', 'test']:
+        out_handles[s].close()
+        print(f'Wrote {counts[s]} {s} cases -> {out_dir / f"cases_{s}.jsonl.gz"}')
+    tmp_dir.rmdir()
 
     stats = []
-    for ds in sorted(set(c['dataset'] for c in all_cases)):
-        subset = [c for c in all_cases if c['dataset'] == ds]
+    for ds, acc in stats_acc.items():
+        n = max(1, acc['n_cases'])
         stats.append({
             'dataset': ds,
-            'n_cases': len(subset),
-            'n_train': sum(c['split'] == 'train' for c in subset),
-            'n_valid': sum(c['split'] == 'valid' for c in subset),
-            'n_test': sum(c['split'] == 'test' for c in subset),
-            'avg_candidates': sum(len(c['candidate_sentences']) for c in subset) / max(1, len(subset)),
-            'avg_gt_sentences': sum(len(c['ground_truth_sentences']) for c in subset) / max(1, len(subset)),
-            'avg_user_history_sentences': sum(len(c['user_history_sentences']) for c in subset) / max(1, len(subset)),
+            'n_cases': acc['n_cases'],
+            'n_train': acc['n_train'],
+            'n_valid': acc['n_valid'],
+            'n_test': acc['n_test'],
+            'avg_candidates': acc['sum_candidates'] / n,
+            'avg_gt_sentences': acc['sum_gt'] / n,
+            'avg_user_history_sentences': acc['sum_hist'] / n,
         })
     pd.DataFrame(stats).to_csv(out_dir / 'dataset_stats.csv', index=False)
 

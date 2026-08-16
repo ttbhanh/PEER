@@ -7,13 +7,9 @@ import joblib
 import numpy as np
 import pandas as pd
 
-# The 9 ranker features described in the paper (semantic x3, aspect x2,
-# context x4). Product-metadata and cross-encoder-reranker variants were
-# tried during development and are not part of the reported model.
 FEATURE_COLUMNS_DEFAULT = [
     'user_sem_sim', 'item_sem_sim', 'target_emb_sim', 'user_aspect_overlap',
     'item_aspect_salience',
-    'helpfulness_norm', 'recency_norm', 'sentence_len_norm', 'aspect_count_norm',
 ]
 
 
@@ -63,8 +59,6 @@ class RankerModel:
             except Exception:
                 if self.backend == 'lightgbm':
                     raise
-        # Fallback if LightGBM is unavailable (e.g. missing OpenMP runtime on
-        # some macOS setups). Not what the paper's reported numbers use.
         from sklearn.ensemble import RandomForestRegressor
         self.model = RandomForestRegressor(n_estimators=100, max_depth=12, min_samples_leaf=3, random_state=42, n_jobs=-1)
         self.model.fit(x, y)

@@ -18,22 +18,13 @@ _MAX_CHARS = 600  # raw-text cap while the pool is still huge; word-level trunca
 def load_temporal_safe_pool(raw_dir: str, dataset: str, cutoff_ts: int,
                              hard_cap: int = 20_000_000, seed: int = 42,
                              user_col: str = 'user_id', item_col: str = 'parent_asin') -> list[tuple[str, str, float, str]]:
-    """Stream dataset's raw reviews, keep only timestamp < cutoff_ts (same temporal
-    boundary as the PEER test split, so the rating-prediction corpus never sees a
-    review from the test period). Loads the *whole* temporally-safe pool rather
-    than reservoir-sampling rows: Amazon review data is extremely sparse (most
-    users have 1-2 reviews), so a random row-level sample destroys the density
-    k-core filtering (see kcore_filter) needs to find any survivors at all -- we
-    learned this the hard way (300k random rows -> 0 users survive 5-core, and
-    even a 4M-row cap was too sparse for cellphone's 20M-review file). Keeps raw
-    (truncated) text rather than pre-tokenized word-id lists -- tokenizing every
-    review in a pool that can be tens of millions of rows, when >80% of them will
-    be dropped by kcore_filter a moment later, wastes memory for nothing; see
-    tokenize_records, called only on the much smaller post-filter survivor set.
-    hard_cap is only a safety valve for a dataset far larger than what we've seen;
-    if a raw file's temporally-safe pool exceeds it, fall back to reservoir
-    sampling for that overflow case only, accepting the same density risk as a
-    documented tradeoff rather than an OOM."""
+    """Stream dataset's raw reviews with timestamp < cutoff_ts (same temporal
+    boundary as the PEER test split). Loads the whole pool rather than
+    reservoir-sampling rows, since review data is sparse enough that a random
+    row sample can leave k-core filtering (see kcore_filter) with no
+    survivors; hard_cap is a safety valve for pools too large to hold in
+    memory. Keeps raw text, not pre-tokenized ids -- tokenization happens
+    later (tokenize_records) on the much smaller post-filter survivor set."""
     review_path = Path(raw_dir) / f'{dataset}_reviews.jsonl'
     rng = random.Random(seed)
     pool: list[tuple[str, str, float, str]] = []
@@ -77,10 +68,8 @@ def tokenize_records(records: list[tuple[str, str, float, str]], review_len: int
 
 
 def cap_by_user(records: list[tuple[str, str, float, list[str]]], max_rows: int, seed: int = 42) -> list[tuple[str, str, float, list[str]]]:
-    """If the k-core-filtered pool is still bigger than we want to train on, cap it
-    by randomly dropping whole *users* (keeping every review from the users kept)
-    rather than randomly dropping rows -- preserves the review-count density that
-    k-core filtering just established, instead of re-sparsifying it."""
+    """Cap the pool by dropping whole users (not random rows), to preserve
+    the density k-core filtering just established."""
     if len(records) <= max_rows:
         return records
     rng = random.Random(seed)
@@ -98,14 +87,9 @@ def cap_by_user(records: list[tuple[str, str, float, list[str]]], max_rows: int,
 
 
 def cap_entities(records: list, max_users: int | None = None, max_items: int | None = None, seed: int = 42) -> list:
-    """Bound the number of distinct users and/or items by keeping only the
-    most-reviewed ones. HRDR's rating-pattern MLP takes the raw (n_items,) or
-    (n_users,) row/column as its *input dimension* -- unlike NARRE's fixed-size
-    ID embeddings, that first Linear layer scales with entity count squared
-    (n_items x n_items/2), so an unfiltered large catalog (cellphone: 67k items)
-    is not just slow, it's an OOM (a single layer with ~2.3B parameters). Capping
-    to the highest-review-count entities keeps the densest, most informative part
-    of the k-core while making that layer tractable."""
+    """Bound distinct users/items to the most-reviewed ones: HRDR's
+    rating-pattern MLP takes a raw (n_items,)/(n_users,) row/column as input,
+    so an unfiltered large catalog can OOM its first Linear layer."""
     if max_items is not None:
         ic = Counter(r[1] for r in records)
         keep_items = {i for i, _ in ic.most_common(max_items)}
@@ -118,12 +102,9 @@ def cap_entities(records: list, max_users: int | None = None, max_items: int | N
 
 
 def kcore_filter(records: list[tuple[str, str, float, list[str]]], k: int = 5) -> list[tuple[str, str, float, list[str]]]:
-    """Standard k-core filtering (iteratively drop users/items with < k reviews
-    until stable) -- the same preprocessing NARRE's and HRDR's own papers apply to
-    raw Amazon data before training. Needed here for a second reason too: HRDR's
-    rating-matrix-as-context step is a dense (n_users x n_items) table, so bounding
-    both dimensions to a dense, review-rich "core" is what keeps that matrix small
-    enough to materialize instead of a few hundred billion floats."""
+    """Standard k-core filtering (iteratively drop users/items with < k
+    reviews until stable) -- also keeps HRDR's dense (n_users, n_items)
+    rating matrix small enough to materialize."""
     recs = records
     while True:
         uc = Counter(r[0] for r in recs)

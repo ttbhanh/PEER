@@ -97,7 +97,6 @@ def normalize_aspects_by_frequency(aspects: Iterable[str], min_count: int = 2, m
         elif a.endswith('s') and a[:-1] in vocab:
             mapping[a] = a[:-1]
         else:
-            # fallback to head noun if frequent
             head = a.split()[-1] if a.split() else a
             mapping[a] = head if head in vocab else a
     return mapping

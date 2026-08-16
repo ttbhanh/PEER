@@ -6,13 +6,14 @@ from pathlib import Path as _ProjectPath
 sys.path.insert(0, str(_ProjectPath(__file__).resolve().parents[1]))
 
 import argparse
-import json
 import multiprocessing as mp
 import os
 import pickle
 from collections import Counter
 from pathlib import Path
 from typing import Any
+
+import json
 
 import numpy as np
 import pandas as pd
@@ -23,15 +24,9 @@ from tqdm import tqdm
 
 from peer.aspects import aspect_overlap
 from peer.sentiment import sentiment_match
-from peer.text import tokenize
-from peer.utils import ensure_dir, cosine_vec
+from peer.utils import ensure_dir, cosine_vec, count_jsonl_lines, jsonl_open, resolve_cases_path
 from scripts.train_peer_retriever import PeerTargetRetriever
 
-# Explicit, fixed schema for the output pairs parquet -- every _process_case row
-# dict always has exactly these keys/types, so writing batches with this schema
-# (rather than letting pyarrow re-infer it per batch) guarantees every
-# row-group in the incrementally-written file is consistent, even for a batch
-# where e.g. every 'aspects' list happens to be empty.
 PAIRS_SCHEMA = pa.schema([
     ('case_id', pa.string()), ('dataset', pa.string()), ('split', pa.string()),
     ('user_id', pa.string()), ('item_id', pa.string()), ('sentence_id', pa.string()),
@@ -39,24 +34,23 @@ PAIRS_SCHEMA = pa.schema([
     ('rating', pa.float64()), ('candidate_rating', pa.float64()),
     ('timestamp', pa.int64()), ('candidate_timestamp', pa.int64()),
     ('aspects', pa.list_(pa.string())), ('user_aspects', pa.list_(pa.string())),
-    ('gt_aspects', pa.list_(pa.string())),
+    ('metadata_aspects', pa.list_(pa.string())), ('gt_aspects', pa.list_(pa.string())),
     ('ground_truth_text', pa.string()), ('user_avg_k', pa.int64()), ('label', pa.float64()),
     ('semantic_to_gt', pa.float64()), ('aspect_match_to_gt', pa.float64()),
     ('coverage_gain', pa.float64()), ('user_sem_sim', pa.float64()),
-    ('item_sem_sim', pa.float64()), ('target_emb_sim', pa.float64()),
+    ('metadata_sem_sim', pa.float64()), ('item_sem_sim', pa.float64()),
+    ('target_emb_sim', pa.float64()),
     ('user_aspect_overlap', pa.float64()),
     ('item_aspect_salience', pa.float64()), ('sentiment_match', pa.float64()),
     ('helpfulness_norm', pa.float64()), ('recency_norm', pa.float64()),
-    ('sentence_len_norm', pa.float64()), ('aspect_count_norm', pa.float64()),
 ])
 
 
 def iter_jsonl_batches(path: Path, batch_size: int):
-    """Stream a cases_{split}.jsonl file in bounded batches instead of loading
-    the whole split into memory at once -- keeps the per-batch working set
-    small and bounded regardless of split size."""
+    """Stream a cases_{split}.jsonl file in bounded batches instead of
+    loading the whole split into memory at once."""
     batch: list[dict[str, Any]] = []
-    with open(path, 'r', encoding='utf-8') as f:
+    with jsonl_open(path, 'r') as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -73,30 +67,29 @@ def to_list(x):
     if x is None:
         return []
     try:
+        import pandas as pd
         if pd.isna(x):
             return []
     except Exception:
         pass
     if isinstance(x, (list, tuple, set)):
         return list(x)
-    if isinstance(x, np.ndarray):
-        return x.tolist()
+    try:
+        import numpy as np
+        if isinstance(x, np.ndarray):
+            return x.tolist()
+    except Exception:
+        pass
     return [x]
 
 
 class _AspectStore:
-    """Read-only sentence_id -> aspect-list lookup backed by a small interned
-    vocabulary + one flat int32 array + integer offsets (CSR layout), instead
-    of a dict[tuple, list[str]] holding one Python list + several Python
-    strings per sentence. Read by forked worker processes (_process_case, via
-    multiprocessing.Pool below) once per candidate sentence, for every case --
-    a dict-of-lists here is dense enough traffic to be the difference between
-    fitting in a bounded-memory environment and OOMing.
-
-    The original key was (case_id, kind, sentence_id); dropping case_id/kind
-    down to sentence_id alone is safe: aspects are a pure function of a
-    sentence's text, so every duplicate sentence_id across different cases'
-    pools already carries byte-identical aspect lists."""
+    """Read-only sentence_id -> aspect-list lookup backed by an interned
+    vocabulary + flat int32 array + offsets (CSR layout), instead of
+    dict[tuple, list[str]] -- avoids fork copy-on-write memory blowup in
+    worker processes. Keyed by sentence_id alone (not case_id/kind): aspects
+    are a pure function of a sentence's text, so a shared sentence_id across
+    cases always carries the same aspect list."""
     __slots__ = ('index', 'aspect_ids', 'offsets', 'vocab')
 
     def __init__(self, index: dict[str, int], aspect_ids: np.ndarray, offsets: np.ndarray, vocab: list[str]):
@@ -142,25 +135,32 @@ def load_aspect_maps(path: Path) -> _AspectStore:
 
 class _EmbeddingStore:
     """Read-only embedding lookup backed by one contiguous 2D array + a
-    str->int index, instead of a dict[str, np.ndarray] with one Python object
-    per row -- see _AspectStore docstring for why this matters under
-    multiprocessing.Pool forking."""
-    __slots__ = ('matrix', 'index')
+    str->int index, instead of dict[str, np.ndarray] -- avoids fork
+    copy-on-write memory blowup in worker processes."""
+    __slots__ = ('matrix', 'index', 'override')
 
-    def __init__(self, matrix: np.ndarray, index: dict[str, int]):
+    def __init__(self, matrix: np.ndarray, index: dict[str, int], override: dict[str, np.ndarray] | None = None):
         self.matrix = matrix
         self.index = index
+        self.override = override or {}
 
     def get(self, sid: str, default=None):
+        if sid in self.override:
+            return self.override[sid]
         idx = self.index.get(sid)
         return self.matrix[idx] if idx is not None else default
 
 
-def load_embeddings(path: Path) -> _EmbeddingStore:
-    emb = np.load(path.with_suffix('.npy'), mmap_mode='r')
+def load_embeddings(path: Path, user_history_override: Path | None = None) -> _EmbeddingStore:
+    emb = np.load(path.with_suffix('.npy'), mmap_mode='r')  # mmap'd, not .npz
     with open(path.with_suffix('.ids.json')) as f:
         ids = json.load(f)
-    return _EmbeddingStore(emb, {sid: i for i, sid in enumerate(ids)})
+    override: dict[str, np.ndarray] = {}
+    if user_history_override is not None:
+        o_ids = json.load(open(user_history_override.with_suffix('.ids.json')))
+        o_vecs = np.load(user_history_override.with_suffix('.npy'))
+        override = {sid: np.asarray(vec, dtype=np.float32) for sid, vec in zip(o_ids, o_vecs)}
+    return _EmbeddingStore(emb, {sid: i for i, sid in enumerate(ids)}, override)
 
 
 def get_emb(embs: _EmbeddingStore, sid: str) -> np.ndarray | None:
@@ -177,13 +177,13 @@ _W: dict[str, Any] = {}
 
 
 def _process_case(item: tuple[str, dict]) -> list[dict[str, Any]]:
-    """Build every feature row for one case. Runs in a forked worker process;
-    reads the shared read-only aspect map and embedding store set up in _W by
-    the parent before Pool creation (copy-on-write fork; no per-task pickling)."""
+    """Build every feature row for one case. Runs in a forked worker process,
+    reading the shared aspect map / embeddings set up in _W by the parent."""
     split, c = item
     aspects = _W['aspects']; embs = _W['embs']; w = _W['weights']; retriever = _W.get('peer_retriever')
     case_id = c['case_id']
     user_aspects = aspects.get(f'{case_id}_user_history', [])
+    metadata_aspects = aspects.get(f'{case_id}_metadata', [])
     if not user_aspects:
         user_aspects = aspects.get(f'{case_id}_user_history_text', [])
     gt_aspects = []
@@ -197,12 +197,10 @@ def _process_case(item: tuple[str, dict]) -> list[dict[str, Any]]:
             gt_embs.append(e)
     gt_aspects_unique = list(dict.fromkeys(gt_aspects))
     user_emb = get_emb(embs, f'{case_id}_user_history_text')
+    meta_emb = get_emb(embs, f'{case_id}_metadata_text')
     item_profile_embs = [get_emb(embs, cand['sentence_id']) for cand in c['candidate_sentences']]
     item_profile_embs = [e for e in item_profile_embs if e is not None]
     item_emb = np.mean(item_profile_embs, axis=0) if item_profile_embs else None
-    # PRAG-style estimate of the target review's own embedding, from (user, item)
-    # context only (see scripts/train_peer_retriever.py). One forward pass per
-    # case, reused below for every candidate's target_emb_sim feature.
     target_emb = None
     if retriever is not None and user_emb is not None and item_emb is not None:
         with torch.no_grad():
@@ -248,6 +246,7 @@ def _process_case(item: tuple[str, dict]) -> list[dict[str, Any]]:
             'candidate_timestamp': int(cand['timestamp']),
             'aspects': s_aspects,
             'user_aspects': user_aspects,
+            'metadata_aspects': metadata_aspects,
             'gt_aspects': gt_aspects_unique,
             'ground_truth_text': c['ground_truth_text'],
             'user_avg_k': int(c.get('user_avg_k', 3)),
@@ -256,6 +255,7 @@ def _process_case(item: tuple[str, dict]) -> list[dict[str, Any]]:
             'aspect_match_to_gt': float(asp_match),
             'coverage_gain': float(cov_gain),
             'user_sem_sim': cosine_vec(s_emb, user_emb) if s_emb is not None and user_emb is not None else 0.0,
+            'metadata_sem_sim': cosine_vec(s_emb, meta_emb) if s_emb is not None and meta_emb is not None else 0.0,
             'item_sem_sim': cosine_vec(s_emb, item_emb) if s_emb is not None and item_emb is not None else 0.0,
             'target_emb_sim': cosine_vec(s_emb, target_emb) if s_emb is not None and target_emb is not None else 0.0,
             'user_aspect_overlap': aspect_overlap(s_aspects, user_aspects),
@@ -263,8 +263,6 @@ def _process_case(item: tuple[str, dict]) -> list[dict[str, Any]]:
             'sentiment_match': float(sent_match),
             'helpfulness_norm': float(cand.get('helpful_vote', 0.0)) / max(1.0, max_help),
             'recency_norm': (int(cand['timestamp']) - min_t) / span_t,
-            'sentence_len_norm': min(1.0, len(tokenize(cand['text'])) / 80.0),
-            'aspect_count_norm': min(1.0, len(set(s_aspects)) / 8.0),
         })
     return rows
 
@@ -274,24 +272,26 @@ def main():
     ap.add_argument('--cases', default='data/cases')
     ap.add_argument('--aspects', default='data/processed/aspects/sentence_aspects.parquet')
     ap.add_argument('--embeddings', default='embeddings/embeddings.npz')
+    ap.add_argument('--user-history-override', default=None,
+                     help='Path stem from scripts/cache_user_history_embeddings.py; merged on top of --embeddings for user_sem_sim/target_emb_sim only')
     ap.add_argument('--output', default='data/processed/pairs')
-    ap.add_argument('--semantic-weight', type=float, default=0.70)
-    ap.add_argument('--aspect-weight', type=float, default=0.15)
-    ap.add_argument('--sentiment-weight', type=float, default=0.10)
-    ap.add_argument('--coverage-weight', type=float, default=0.05)
+    ap.add_argument('--semantic-weight', type=float, default=0.4)
+    ap.add_argument('--aspect-weight', type=float, default=0.3)
+    ap.add_argument('--sentiment-weight', type=float, default=0.2)
+    ap.add_argument('--coverage-weight', type=float, default=0.1)
     ap.add_argument('--num-workers', type=int, default=min(os.cpu_count() or 1, 64),
                      help='Parallel worker processes for per-case feature building (fork-based)')
     ap.add_argument('--batch-size', type=int, default=3000,
-                     help='Cases per batch; each batch is written to the output parquet immediately '
-                          '(incremental row-groups) instead of accumulating the whole split in memory. '
-                          'Lower this on tighter RAM budgets.')
+                     help='Cases per batch, written to the output parquet incrementally instead of accumulating '
+                          'the whole split in memory. Lower this on tighter RAM budgets.')
     ap.add_argument('--peer-retriever', default='models/peer_target_retriever.pt',
                      help='Checkpoint from scripts/train_peer_retriever.py for the target_emb_sim feature; skipped (feature=0) if missing')
     args = ap.parse_args()
 
     out_dir = ensure_dir(args.output)
     _W['aspects'] = load_aspect_maps(Path(args.aspects))
-    _W['embs'] = load_embeddings(Path(args.embeddings))
+    override_path = Path(args.user_history_override) if args.user_history_override else None
+    _W['embs'] = load_embeddings(Path(args.embeddings), override_path)
     retriever_path = Path(args.peer_retriever)
     if retriever_path.exists():
         with open(retriever_path, 'rb') as f:
@@ -314,10 +314,10 @@ def main():
     batch_size = max(1, args.batch_size)
 
     for split in ['train', 'valid', 'test']:
-        path = Path(args.cases) / f'cases_{split}.jsonl'
-        if not path.exists():
+        path = resolve_cases_path(args.cases, split)
+        if path is None:
             continue
-        n_cases = sum(1 for _ in open(path, 'r', encoding='utf-8') if _.strip())
+        n_cases = count_jsonl_lines(path)
         out_path = out_dir / f'{split}.parquet'
         writer: pq.ParquetWriter | None = None
         total_rows = 0

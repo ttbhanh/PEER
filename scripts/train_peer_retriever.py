@@ -1,28 +1,12 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
-"""A PRAG-style "estimated target-review embedding" retriever, owned by PEER
-itself rather than the PRAG baseline: same mechanism (a small MLP estimates the
-target review's embedding from context, candidates are then scored by cosine
-similarity to that estimate), trained the same way (minimize 1 - cosine to the
-true ground-truth embedding), but the context is (user_history_emb, item_emb)
-instead of PRAG's own (user_history_emb, metadata_emb).
-
-Why not reuse baselines/published's PragRetriever directly: PEER's own ranker
-and selector deliberately dropped product metadata (title/brand/category) after
-an ablation showed it contributed inside noise (see peer/models.py,
-scripts/select_topk.py) -- reusing a metadata-conditioned retriever as a PEER
-feature would quietly reintroduce it through the back door. item_emb (the mean
-embedding of this item's own candidate review sentences, already computed in
-build_features.py for the item_sem_sim feature) gives the retriever the same
-kind of (user, item)-conditioned context PRAG's paper describes, without touching
-metadata.
-
-Output feeds build_features.py's target_emb_sim feature: cosine(candidate_emb,
-estimated_target_emb) -- PEER's own version of the specific signal that makes
-PRAG's sem_f1 strong, exposed to the LTR ranker as one feature among others
-rather than the sole ranking criterion.
-"""
+"""PEER's own target-interest retriever: a small MLP estimates the target
+review's embedding from (user_history_emb, item_emb), trained to minimize
+1 - cosine to the true ground-truth embedding. Unlike PRAG's retriever, the
+context is (user, item) not (user, metadata) -- PEER's ranker deliberately
+drops product metadata. Output feeds build_features.py's target_emb_sim
+feature."""
 
 import sys
 from pathlib import Path as _ProjectPath
@@ -40,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from peer.utils import ensure_dir, read_jsonl
+from peer.utils import ensure_dir, read_jsonl, resolve_cases_path
 
 
 class PeerTargetRetriever(nn.Module):
@@ -59,14 +43,19 @@ class PeerTargetRetriever(nn.Module):
         return F.normalize(self.net(x), dim=-1)
 
 
-def load_embeddings(path: str) -> dict[str, np.ndarray]:
-    # Plain .npy (mmap-able) + sibling ids.json, not .npz -- see
-    # peer/embeddings.py::_npy_and_ids_paths.
+def load_embeddings(path: str, user_history_override: str | None = None) -> dict[str, np.ndarray]:
     p = Path(path)
     emb = np.load(p.with_suffix('.npy'), mmap_mode='r')
     with open(p.with_suffix('.ids.json')) as f:
         ids = json.load(f)
-    return {str(ids[i]): emb[i] for i in range(len(ids))}
+    out = {str(ids[i]): np.asarray(emb[i], dtype=np.float32) for i in range(len(ids))}
+    if user_history_override:
+        o_ids = json.load(open(f'{user_history_override}.ids.json'))
+        o_vecs = np.load(f'{user_history_override}.npy')
+        for sid, vec in zip(o_ids, o_vecs):
+            out[str(sid)] = np.asarray(vec, dtype=np.float32)
+        print(f'merged in {len(o_ids)} PEER user-history embeddings (override)', flush=True)
+    return out
 
 
 def item_embedding(case: dict, embs: dict[str, np.ndarray]) -> np.ndarray | None:
@@ -90,7 +79,9 @@ def build_dataset(cases_path: str, embs: dict[str, np.ndarray]) -> tuple[np.ndar
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--cases', default='data/cases')
-    ap.add_argument('--embeddings', default='embeddings/embeddings.npz')
+    ap.add_argument('--embeddings', default='embeddings/embeddings')
+    ap.add_argument('--user-history-override', default=None,
+                     help='Path stem from scripts/cache_user_history_embeddings.py; merged in on top of --embeddings for the user_history_text id')
     ap.add_argument('--hidden', type=int, default=512)
     ap.add_argument('--epochs', type=int, default=30)
     ap.add_argument('--batch-size', type=int, default=256)
@@ -101,10 +92,10 @@ def main():
 
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
 
-    embs = load_embeddings(args.embeddings)
+    embs = load_embeddings(args.embeddings, args.user_history_override)
     print('Building train/valid datasets (needs candidate sentence embeddings per case)...')
-    train_u, train_i, train_y = build_dataset(f'{args.cases}/cases_train.jsonl', embs)
-    valid_u, valid_i, valid_y = build_dataset(f'{args.cases}/cases_valid.jsonl', embs)
+    train_u, train_i, train_y = build_dataset(resolve_cases_path(args.cases, 'train'), embs)
+    valid_u, valid_i, valid_y = build_dataset(resolve_cases_path(args.cases, 'valid'), embs)
     emb_dim = train_u.shape[1]
     print(f'train={len(train_u)} valid={len(valid_u)} emb_dim={emb_dim}')
 

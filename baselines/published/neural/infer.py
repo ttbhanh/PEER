@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 """Inference-time scoring of PEER candidate reviews using a trained NARRE/HRDR
-checkpoint. We only need the attention sub-computation (per-review "usefulness"
-weight), not the full rating-prediction head: NARRE's item-side attention context
-is the *author* of each candidate review (this matches the official model, where
-input_reiid is "which user wrote this review of item i", not the querying user --
-personalization instead flows through combining review-attention with the
-querying user's own review-based tower at prediction time, which PEER's
-sentence-selection task has no use for). HRDR's context is the item's column of
-the (frozen) rating matrix, unaffected by which user is asking."""
+checkpoint: only the attention sub-computation (per-review "usefulness"
+weight) is used, not the full rating-prediction head. NARRE's attention
+context is the review's author; HRDR's is the item's column of the rating
+matrix."""
 
 import io
 import pickle
@@ -25,11 +21,8 @@ PAD, UNK = 0, 1
 
 
 class _CPUUnpickler(pickle.Unpickler):
-    """Checkpoints here are saved with plain pickle.dump (not torch.save), so a
-    CUDA-trained checkpoint's tensor storages embed a CUDA device tag that
-    torch.load(..., map_location=...) does not propagate through the nested
-    torch.storage._load_from_bytes call pickle triggers for each tensor. Force
-    every such nested load to CPU explicitly."""
+    """Forces a CUDA-trained checkpoint's tensor storages to load on CPU,
+    since plain pickle.dump doesn't respect torch.load's map_location."""
 
     def find_class(self, module, name):
         if module == 'torch.storage' and name == '_load_from_bytes':
@@ -62,9 +55,7 @@ class NarreScorer:
 
     @torch.no_grad()
     def score_reviews(self, review_texts: list[str], review_authors: list[str]) -> list[float]:
-        """One attention weight per review (softmax over the given review set),
-        higher = the trained model finds this review more useful/representative
-        for this item, exactly NARRE's own review-usefulness signal."""
+        """One attention weight per review (softmax over the set)."""
         if not review_texts:
             return []
         m = self.model
@@ -75,9 +66,7 @@ class NarreScorer:
         b, review_num, review_len = word_ids.shape
         emb = m.word_emb(word_ids.view(review_num, review_len))
         h_pool = m.cnn(emb).view(1, review_num, -1)
-        # item-side attention context = the review's author (att_user_id), matching
-        # the model's own _side(..., self.att_user_id, ...) call for i_feas/i_att
-        ctx = F.relu(m.att_user_id(author_idx))
+        ctx = F.relu(m.att_user_id(author_idx))  # context = review's author
         att_logit = m.Wpi(F.relu(m.Wai(h_pool) + m.Wru_i(ctx))).squeeze(-1)
         att = F.softmax(att_logit, dim=1).squeeze(0)
         return att.tolist()
@@ -97,8 +86,7 @@ class HrdrScorer:
 
     @torch.no_grad()
     def score_reviews(self, review_texts: list[str], item_id: str) -> list[float]:
-        """Attention weight per review using the item's rating-pattern context
-        (HRDR's context is the item, not the review author -- see module docstring)."""
+        """Attention weight per review using the item's rating-pattern context."""
         if not review_texts:
             return []
         m = self.model

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import random
@@ -28,9 +29,39 @@ def set_seed(seed: int = 42) -> None:
         pass
 
 
+def jsonl_open(path: str | Path, mode: str):
+    """open() that transparently switches to gzip when the path ends in .gz."""
+    if str(path).endswith('.gz'):
+        kwargs = {'compresslevel': 4} if 'w' in mode else {}
+        return gzip.open(path, mode + 't', encoding='utf-8', **kwargs)
+    return open(path, mode, encoding='utf-8')
+
+
+def resolve_cases_path(cases_dir: str | Path, split: str) -> Path | None:
+    """Resolve cases_{split}.jsonl or cases_{split}.jsonl.gz; None if neither exists."""
+    cases_dir = Path(cases_dir)
+    plain = cases_dir / f'cases_{split}.jsonl'
+    if plain.exists():
+        return plain
+    gz = cases_dir / f'cases_{split}.jsonl.gz'
+    if gz.exists():
+        return gz
+    return None
+
+
+def count_jsonl_lines(path: str | Path) -> int:
+    """Count non-blank lines without materializing rows."""
+    n = 0
+    with jsonl_open(path, 'r') as f:
+        for line in f:
+            if line.strip():
+                n += 1
+    return n
+
+
 def read_jsonl(path: str | Path, max_rows: int | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    with open(path, 'r', encoding='utf-8') as f:
+    with jsonl_open(path, 'r') as f:
         for i, line in enumerate(f):
             if max_rows is not None and i >= max_rows:
                 break
@@ -43,7 +74,7 @@ def read_jsonl(path: str | Path, max_rows: int | None = None) -> list[dict[str, 
 
 def write_jsonl(rows: Iterable[dict[str, Any]], path: str | Path) -> None:
     ensure_dir(Path(path).parent)
-    with open(path, 'w', encoding='utf-8') as f:
+    with jsonl_open(path, 'w') as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + '\n')
 
@@ -82,12 +113,7 @@ def coalesce(row: dict[str, Any], keys: list[str], default: Any = None) -> Any:
 
 
 def normalize_timestamp(ts: Any) -> int:
-    """Return integer milliseconds/seconds order-preserving timestamp.
-
-    Amazon Reviews 2023 timestamps are usually integer milliseconds. Some
-    preprocessed files may already use seconds or ISO strings. For temporal
-    splitting we only need a stable sortable integer.
-    """
+    """Normalize an int/float/ISO-string timestamp to a stable sortable integer."""
     if pd.isna(ts):
         return 0
     if isinstance(ts, (int, np.integer)):

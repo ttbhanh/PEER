@@ -1,28 +1,9 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
-"""Task-adapted reimplementations of 5 published baselines, each following the
-*actual* mechanism of its paper (see configs/baselines/manifest.json for
-citations and per-method adaptation notes, since none of the five were
-designed for sentence-level evidence selection):
-
-  a2spr    Huang et al. 2020 -- cosine similarity between per-aspect sentiment
-           vectors (candidate sentence vs. user history).
-  erra_r   ACL 2023 -- dense retrieval against a user+metadata query embedding,
-           boosted for candidates covering the (user,item) pair's top-n salient
-           aspects. (The paper's explanation-generation stage does not apply.)
-  prag     EMNLP 2023 -- a small trained retriever estimates a target-review
-           embedding from (user, metadata) and ranks candidates by similarity
-           to it; a scaled-down stand-in for the paper's transformer retriever
-           (see scripts/train_prag_retriever.py). Generation stage not applicable.
-  narre    WWW 2018 -- real trained CNN+attention rating-prediction network
-           (scripts/train_published_neural.py); we score candidates using its
-           item-side attention (context = each candidate review's author),
-           i.e. the paper's own "review usefulness" signal.
-  hrdr     Neurocomputing 2020 -- same training entrypoint, --model hrdr;
-           attention context is the frozen user-item rating matrix instead of
-           review-author identity.
-"""
+"""Task-adapted reimplementations of 5 published baselines: a2spr, erra_r,
+prag, narre, hrdr. See configs/baselines/manifest.json for citations and
+per-method adaptation notes."""
 
 import sys
 from pathlib import Path as _ProjectPath
@@ -42,7 +23,7 @@ from tqdm import tqdm
 from peer.aspects import extract_aspect_phrases, canonicalize_aspect
 from peer.aspect_sentiment import AspectVector, build_aspect_sentiment_vector, cosine_sparse
 from peer.selectors import resolve_k, topk
-from peer.utils import cosine_vec, ensure_dir, read_jsonl, write_jsonl
+from peer.utils import cosine_vec, ensure_dir, read_jsonl, resolve_cases_path, write_jsonl
 from baselines.published.neural.infer import NarreScorer, HrdrScorer
 from scripts.train_prag_retriever import PragRetriever
 
@@ -183,11 +164,11 @@ def main():
     ap.add_argument('--models-dir', default='models')
     ap.add_argument('--output', default='outputs/predictions/published')
     ap.add_argument('--dataset', default=None,
-                     help='Restrict to one dataset instead of the whole split at once; output filenames get a '
-                          '__{dataset} suffix so per-dataset runs can be concatenated afterward.')
+                     help='Restrict to one dataset (e.g. baby/yelp/googlelocal) to bound peak memory; output '
+                          'filenames get a __{dataset} suffix to merge (concatenate) after all datasets are scored.')
     args = ap.parse_args()
 
-    cases = read_jsonl(f'{args.cases}/cases_{args.split}.jsonl')
+    cases = read_jsonl(resolve_cases_path(args.cases, args.split))
     if args.dataset is not None:
         cases = [c for c in cases if c['dataset'] == args.dataset]
     case_ids = {c['case_id'] for c in cases}
