@@ -80,9 +80,10 @@ def main():
         with ctx.Pool(processes=n_workers, initializer=_init_worker, initargs=(args.method,)) as pool:
             per_row_aspects = list(tqdm(pool.imap(_extract_task, tasks, chunksize=chunksize), total=len(tasks)))
 
-    all_raw_aspects = [a for asp in per_row_aspects for a in asp]
-    mapping = normalize_aspects_by_frequency(all_raw_aspects, min_count=args.min_count, max_vocab=args.max_vocab)
-    vocab_counter = Counter(mapping.get(a, a) for a in all_raw_aspects)
+    # Vocabulary built from train only, then applied to canonicalize valid/test too.
+    train_raw_aspects = [a for meta, asp in zip(raw_rows_meta, per_row_aspects) if meta['split'] == 'train' for a in asp]
+    mapping = normalize_aspects_by_frequency(train_raw_aspects, min_count=args.min_count, max_vocab=args.max_vocab)
+    vocab_counter = Counter(mapping.get(a, a) for a in train_raw_aspects)
     vocab = [{'aspect': a, 'count': c} for a, c in vocab_counter.most_common(args.max_vocab)]
     write_jsonl(vocab, out_dir / 'aspect_vocab.jsonl')
 

@@ -201,7 +201,15 @@ def main():
                 hrdr_scorers[ds] = HrdrScorer(str(p))
             else:
                 print(f'WARNING: no HRDR checkpoint for dataset={ds} ({p}); scores will be 0')
-    prag_model = load_prag_model(str(Path(args.models_dir) / 'prag_retriever.pt')) if 'prag' in args.methods else None
+    prag_models: dict[str, Any] = {}
+    if 'prag' in args.methods:
+        for ds in datasets:
+            p = Path(args.models_dir) / f'prag_retriever_{ds}.pt'
+            model = load_prag_model(str(p))
+            if model is not None:
+                prag_models[ds] = model
+            else:
+                print(f'WARNING: no PRAG checkpoint for dataset={ds} ({p}); scores will be 0')
 
     predictions: dict[str, list[dict]] = {m: [] for m in args.methods}
 
@@ -225,7 +233,7 @@ def main():
         if 'erra_r' in args.methods:
             method_scores['erra_r'] = score_erra_r(case, cand_aspects, embs, user_aspect_counts)
         if 'prag' in args.methods:
-            method_scores['prag'] = score_prag(case, embs, prag_model)
+            method_scores['prag'] = score_prag(case, embs, prag_models.get(case['dataset']))
         if 'narre' in args.methods:
             method_scores['narre'] = score_narre(case, narre_scorers.get(case['dataset']))
         if 'hrdr' in args.methods:
